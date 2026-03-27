@@ -2,8 +2,10 @@ import os
 import sys
 import csv
 import json
+import shutil
 import threading
 import queue
+import urllib.request
 from datetime import datetime
 
 import cv2
@@ -121,6 +123,80 @@ def resolve_default_model_path(app_dir: str) -> str:
         if os.path.exists(p):
             return p
     return candidates[0]
+
+
+def _iter_model_download_urls(model_path: str):
+    basename = os.path.basename(model_path)
+    stem = os.path.splitext(basename)[0]
+    env_names = [
+        f"{stem.upper()}_MODEL_URL",
+        "CCTV_ROI_MODEL_URL",
+        "YOLO_MODEL_URL",
+    ]
+    seen = set()
+    for env_name in env_names:
+        url = (os.getenv(env_name) or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            yield env_name, url
+
+
+def _download_model_from_url(url: str, target_path: str, status_cb=None):
+    ensure_dir(os.path.dirname(target_path))
+    temp_path = target_path + ".download"
+
+    if status_cb:
+        status_cb(f"[MODEL] 下載模型中：{url}")
+
+    with urllib.request.urlopen(url, timeout=120) as resp, open(temp_path, "wb") as f:
+        shutil.copyfileobj(resp, f)
+
+    if not os.path.exists(temp_path) or os.path.getsize(temp_path) <= 0:
+        raise RuntimeError("下載完成但檔案為空。")
+
+    os.replace(temp_path, target_path)
+    return target_path
+
+
+def ensure_model_available(model_path: str, status_cb=None):
+    model_path = os.path.abspath(model_path)
+    if os.path.exists(model_path) and os.path.getsize(model_path) > 0:
+        return True, model_path
+
+    basename = os.path.basename(model_path)
+
+    for env_name, url in _iter_model_download_urls(model_path):
+        try:
+            downloaded_path = _download_model_from_url(url, model_path, status_cb=status_cb)
+            return True, downloaded_path
+        except Exception as e:
+            if status_cb:
+                status_cb(f"[MODEL] {env_name} 下載失敗：{e}")
+
+    try:
+        from ultralytics.utils.downloads import attempt_download_asset
+
+        if status_cb:
+            status_cb(f"[MODEL] 嘗試透過 Ultralytics 自動下載：{basename}")
+
+        downloaded = attempt_download_asset(basename)
+        if downloaded and os.path.exists(downloaded):
+            ensure_dir(os.path.dirname(model_path))
+            if norm_path(downloaded) != norm_path(model_path):
+                shutil.copy2(downloaded, model_path)
+            return True, model_path if os.path.exists(model_path) else downloaded
+    except Exception as e:
+        if status_cb:
+            status_cb(f"[MODEL] Ultralytics 自動下載失敗：{e}")
+
+    message = (
+        f"找不到模型檔：\n{model_path}\n\n"
+        "已嘗試：\n"
+        "1. 本地 models 資料夾\n"
+        "2. 環境變數 URL（YOLO26X_MODEL_URL / CCTV_ROI_MODEL_URL / YOLO_MODEL_URL）\n"
+        "3. Ultralytics 資產自動下載\n"
+    )
+    return False, message
 
 
 def norm_path(path: str) -> str:

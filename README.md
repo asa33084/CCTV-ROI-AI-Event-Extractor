@@ -60,14 +60,28 @@ pip install -r requirements.txt
 
 ### 3. 安裝 PyTorch
 
-本專案會用到 `torch` 做 CUDA 裝置判斷，但 CPU / GPU 版本安裝方式不同，建議依你的環境從 PyTorch 官方指令安裝：
+本專案會用到 `torch` 做 CUDA 自動判斷與 GPU 推論。
 
-- CPU 環境可安裝 CPU 版 `torch`
-- NVIDIA CUDA 環境請安裝對應 CUDA 版本的 `torch`
+如果你要讓程式自動使用 NVIDIA GPU，直接安裝 GPU 依賴檔：
 
-如果你已透過 `ultralytics` 安裝流程帶入 `torch`，通常不需要再重裝。
+```powershell
+pip install -r requirements-gpu.txt
+```
 
-Qt 版已內建拖放，不需要額外安裝 `tkinterdnd2`。
+目前 `requirements-gpu.txt` 使用 PyTorch 官方 CUDA 12.8 wheel。
+
+如果你只打算跑 CPU，則維持：
+
+```powershell
+pip install -r requirements.txt
+```
+
+程式本身會自動偵測：
+
+- 偵測到可用 CUDA 時使用 GPU
+- 否則自動退回 CPU
+
+如果你的顯示卡或驅動不適合 CUDA 12.8，需改成對應版本的 PyTorch wheel 索引。
 
 ## 模型檔放置
 
@@ -80,7 +94,26 @@ models\yolo26n.pt
 yolo26n.pt
 ```
 
-若找不到模型檔，GUI 會提示錯誤並停止執行。
+若找不到模型檔，程式會自動嘗試補齊：
+
+1. 先檢查本地 `models/` 與程式同層
+2. 再嘗試 Ultralytics 資產自動下載
+3. 若你使用自家模型來源，可透過環境變數指定下載網址
+
+可用環境變數：
+
+```powershell
+$env:YOLO26X_MODEL_URL="https://your-server/path/yolo26x.pt"
+```
+
+也支援：
+
+```powershell
+$env:CCTV_ROI_MODEL_URL="https://your-server/path/yolo26x.pt"
+$env:YOLO_MODEL_URL="https://your-server/path/yolo26x.pt"
+```
+
+下載成功後，模型會落到預設模型路徑，例如 `models\yolo26x.pt`。
 
 ## 啟動方式
 
@@ -135,7 +168,7 @@ roi_config_polygon.json
 - `opencv-python`：影片讀寫與影像處理
 - `numpy`：數值運算
 - `PySide6`：Qt GUI
-- `torch`：可選，但建議安裝，用於 CUDA 判斷與模型執行環境
+- `torch`：GPU 自動偵測與模型執行環境
 
 ## 注意事項
 

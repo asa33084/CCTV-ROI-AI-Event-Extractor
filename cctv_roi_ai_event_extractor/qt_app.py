@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from cctv_roi_ai_event_extractor.core import (
     APP_VERSION,
     ObjectDetector,
+    ensure_model_available,
     ensure_dir,
     find_first_readable_video,
     get_app_dir,
@@ -992,9 +993,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未選擇輸出類型", "請至少勾選一種輸出類型：截圖或事件片段。")
             return
 
-        if not os.path.exists(self.model_path):
-            QMessageBox.critical(self, "模型不存在", f"找不到模型檔：\n{self.model_path}\n\n請先把 yolo26x.pt 放到 models 資料夾（或程式同層）。")
+        self.set_status("檢查模型中...")
+        model_ok, model_result = ensure_model_available(self.model_path, status_cb=self.set_status)
+        if not model_ok:
+            QMessageBox.critical(self, "模型不存在", model_result)
             return
+        self.model_path = model_result
+        self.lbl_model.setText(f"模型路徑：{self.model_path}")
 
         out_dir = QFileDialog.getExistingDirectory(self, "選擇輸出資料夾（將自動排除不搜尋）", self.input_dir)
         if not out_dir:
