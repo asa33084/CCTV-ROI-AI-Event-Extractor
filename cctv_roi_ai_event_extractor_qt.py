@@ -1,4 +1,4 @@
-from cctv_roi_ai_event_extractor.qt_app import main
+from cctv_roi_ai_event_extractor.gui import main
 
 
 if __name__ == "__main__":

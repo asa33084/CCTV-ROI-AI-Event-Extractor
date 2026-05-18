@@ -1,4 +1,4 @@
-from cctv_roi_ai_event_extractor_legacy_backend import (
+from cctv_roi_ai_event_extractor.event_processing import (
     APP_VERSION,
     LONG_STAY_SCREENSHOT_INTERVAL_SEC,
     ObjectDetector,
@@ -7,6 +7,7 @@ from cctv_roi_ai_event_extractor_legacy_backend import (
     draw_anchor_point,
     draw_detection,
     draw_polygon_overlay,
+    describe_available_compute_devices,
     ensure_model_available,
     ensure_dir,
     export_interval_clip,
@@ -16,6 +17,7 @@ from cctv_roi_ai_event_extractor_legacy_backend import (
     get_bottom_center,
     get_roi_config_path,
     is_subpath,
+    list_available_compute_devices,
     load_roi_config,
     norm_path,
     point_in_polygon,
@@ -29,6 +31,16 @@ from cctv_roi_ai_event_extractor_legacy_backend import (
     save_roi_config,
     try_save_screenshot,
 )
+from cctv_roi_ai_event_extractor.lpr import (
+    LicensePlateRecognizer,
+    normalize_taiwan_plate_text,
+    is_valid_taiwan_plate,
+)
+from cctv_roi_ai_event_extractor.evidence_report import (
+    build_evidence_rows,
+    parse_video_start_datetime,
+    write_evidence_workbook,
+)
 
 __all__ = [
     "APP_VERSION",
@@ -39,6 +51,7 @@ __all__ = [
     "draw_anchor_point",
     "draw_detection",
     "draw_polygon_overlay",
+    "describe_available_compute_devices",
     "ensure_model_available",
     "ensure_dir",
     "export_interval_clip",
@@ -48,6 +61,7 @@ __all__ = [
     "get_bottom_center",
     "get_roi_config_path",
     "is_subpath",
+    "list_available_compute_devices",
     "load_roi_config",
     "norm_path",
     "point_in_polygon",
@@ -60,4 +74,10 @@ __all__ = [
     "save_frame",
     "save_roi_config",
     "try_save_screenshot",
+    "LicensePlateRecognizer",
+    "normalize_taiwan_plate_text",
+    "is_valid_taiwan_plate",
+    "build_evidence_rows",
+    "parse_video_start_datetime",
+    "write_evidence_workbook",
 ]

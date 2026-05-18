@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.runtime/
+Ultralytics/
+models/
+roi_config_polygon.json
+*.download

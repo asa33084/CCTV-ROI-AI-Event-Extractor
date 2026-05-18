@@ -9,8 +9,12 @@
 - 偵測 `person`、`car`、`motorcycle`、`bus`、`truck`
 - 只有當目標底部中心點進入 ROI 並連續達到門檻幀數時，才判定事件開始
 - 可輸出事件截圖、事件片段、CSV 日誌與文字摘要報表
+- 可輸出蒐證 Excel，欄位為 `編號`、`進入日期`、`出去日期`、`車號`、`車輛截圖`
 - 支援 CPU / CUDA 自動判斷
 - Qt GUI，內建拖放來源清單
+- UI 內建即時 log 視窗
+- 可手動指定 CPU、單張 GPU 或多張 GPU 裝置字串
+- 可選配車牌辨識：YOLO 車牌偵測、透視校正、OCR 引擎介面、臺灣牌照格式校正
 
 ## 專案結構
 
@@ -19,8 +23,14 @@
 |- cctv_roi_ai_event_extractor/
 |  |- __init__.py
 |  |- __main__.py
+|  |- config.py
 |  |- core.py
+|  |- event_processing.py
+|  |- evidence_report.py
+|  |- gui.py
+|  |- lpr.py
 |  `- qt_app.py
+|- .env.example
 |- cctv_roi_ai_event_extractor_legacy_backend.py
 |- cctv_roi_ai_event_extractor_qt.py
 |- cctv_roi_ai_event_extractor_v4_new.py
@@ -31,10 +41,26 @@
 說明：
 
 - `cctv_roi_ai_event_extractor/core.py`：核心 API 對外入口
-- `cctv_roi_ai_event_extractor/qt_app.py`：Qt GUI
+- `cctv_roi_ai_event_extractor/config.py`：環境變數與執行設定
+- `cctv_roi_ai_event_extractor/event_processing.py`：偵測、ROI、截圖、片段輸出等處理流程
+- `cctv_roi_ai_event_extractor/evidence_report.py`：蒐證 Excel 輸出與截圖嵌入
+- `cctv_roi_ai_event_extractor/gui.py`：Qt GUI
+- `cctv_roi_ai_event_extractor/lpr.py`：車牌偵測、校正、OCR 介面、臺灣格式校正
+- `cctv_roi_ai_event_extractor/qt_app.py`：舊 package 入口相容檔
 - `cctv_roi_ai_event_extractor_qt.py`：相容啟動檔
 - `cctv_roi_ai_event_extractor_v4_new.py`：相容 re-export 檔
-- `cctv_roi_ai_event_extractor_legacy_backend.py`：舊版 backend 實作，供過渡期沿用
+- `cctv_roi_ai_event_extractor_legacy_backend.py`：舊版匯入/執行相容檔
+- `.env.example`：環境變數範例
+
+## 12-Factor 對應
+
+- Codebase：主程式已集中在 `cctv_roi_ai_event_extractor/` package，根目錄只保留相容入口。
+- Dependencies：Python 套件依賴仍由 `requirements.txt` 與 `requirements-gpu.txt` 明確宣告。
+- Config：可變設定改由環境變數注入，不需修改原始碼。
+- Backing services：模型下載來源以 URL 環境變數設定。
+- Build / release / run：安裝依賴、設定環境變數、執行 GUI 三步分離。
+- Processes：建議以 `python -m cctv_roi_ai_event_extractor` 啟動單一前景程序。
+- Logs：GUI 內顯示即時 log，批次結果輸出到 `logs/detection_log.csv` 與 `reports/report_summary.txt`。
 
 ## 執行需求
 
@@ -56,6 +82,13 @@ python -m venv .venv
 
 ```powershell
 pip install -r requirements.txt
+```
+
+也可不啟用 PowerShell 環境，直接使用專案虛擬環境：
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m cctv_roi_ai_event_extractor
 ```
 
 ### 3. 安裝 PyTorch
@@ -103,6 +136,7 @@ yolo26n.pt
 可用環境變數：
 
 ```powershell
+$env:CCTV_ROI_MODEL_PATH="C:\models\yolo26x.pt"
 $env:YOLO26X_MODEL_URL="https://your-server/path/yolo26x.pt"
 ```
 
@@ -114,6 +148,43 @@ $env:YOLO_MODEL_URL="https://your-server/path/yolo26x.pt"
 ```
 
 下載成功後，模型會落到預設模型路徑，例如 `models\yolo26x.pt`。
+
+其他可用設定：
+
+```powershell
+$env:CCTV_ROI_APP_DIR="C:\cctv-roi-runtime"
+$env:CCTV_ROI_CONFIG_PATH="C:\cctv-roi-runtime\roi_config_polygon.json"
+$env:CCTV_ROI_LONG_STAY_SCREENSHOT_INTERVAL_SEC="5"
+$env:YOLO_CONFIG_DIR="C:\cctv-roi-runtime\.runtime\ultralytics"
+```
+
+若未指定 `YOLO_CONFIG_DIR`，程式會自動使用專案內 `.runtime\ultralytics`，避免 Ultralytics 嘗試寫入受限的使用者設定目錄。
+
+車牌辨識可用設定：
+
+```powershell
+$env:CCTV_ROI_LPR_ENABLED="true"
+$env:CCTV_ROI_LPR_PLATE_MODEL_PATH="C:\models\license_plate_yolo.pt"
+$env:CCTV_ROI_LPR_OCR_ENGINE="svtr"
+$env:CCTV_ROI_LPR_CONFIDENCE="0.35"
+$env:CCTV_ROI_LPR_SVTR_MODEL_PATH="C:\models\taiwan_plate_svtr.onnx"
+$env:CCTV_ROI_LPR_SVTR_CHARSET="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+$env:CCTV_ROI_LPR_SVTR_INPUT_SIZE="48x160"
+$env:CCTV_ROI_LPR_SVTR_BLANK_INDEX="0"
+$env:CCTV_ROI_LPR_SVTR_PROVIDERS="auto"
+```
+
+說明：
+
+- `CCTV_ROI_LPR_PLATE_MODEL_PATH`：車牌偵測 YOLO 模型路徑。
+- `CCTV_ROI_LPR_OCR_ENGINE`：目前可填 `svtr`、`none`、`easyocr` 或 `tesseract`。建議最高準確率路線使用 `svtr`。
+- `CCTV_ROI_LPR_SVTR_MODEL_PATH`：SVTR / Transformer-style recognizer 的 ONNX 模型路徑。
+- `CCTV_ROI_LPR_SVTR_CHARSET`：模型輸出的字元集，預設為臺灣車牌常用英數字元。
+- `CCTV_ROI_LPR_SVTR_CHARSET_PATH`：若字元集較複雜，可改用一行一字元的文字檔。
+- `CCTV_ROI_LPR_SVTR_INPUT_SIZE`：OCR 模型輸入尺寸，格式為 `高度x寬度`。
+- `CCTV_ROI_LPR_SVTR_BLANK_INDEX`：CTC blank index，常見為 `0`。
+- `CCTV_ROI_LPR_SVTR_PROVIDERS`：ONNX Runtime provider，`auto` 會優先使用 CUDA / DirectML / CPU 中可用者。
+- CRNN / LPRNet / 其他 Transformer OCR 也可接到 `lpr.py` 的 `OcrEngine` 介面；輸出會先經臺灣牌照格式校正後寫入 CSV。
 
 ## 啟動方式
 
@@ -153,7 +224,14 @@ output_root/
 |- logs/
 |  `- detection_log.csv
 `- reports/
+   |- evidence_report.xlsx
    `- report_summary.txt
+```
+
+若啟用車牌辨識，`detection_log.csv` 會增加：
+
+```text
+plate_text, plate_raw_text, plate_confidence, plate_bbox, plate_valid_taiwan_format, plate_ocr_engine
 ```
 
 另外 ROI 設定會儲存在程式同層：
@@ -162,6 +240,8 @@ output_root/
 roi_config_polygon.json
 ```
 
+若設定 `CCTV_ROI_CONFIG_PATH`，ROI 設定會改存到指定檔案。
+
 ## 主要依賴說明
 
 - `ultralytics`：YOLO 模型推論
@@ -169,6 +249,9 @@ roi_config_polygon.json
 - `numpy`：數值運算
 - `PySide6`：Qt GUI
 - `torch`：GPU 自動偵測與模型執行環境
+- `openpyxl` / `Pillow`：蒐證 Excel 與截圖嵌入
+- `onnxruntime`：SVTR / Transformer-style 車牌 OCR 推論
+- `easyocr` / `pytesseract`：可選 OCR 後端，只有啟用對應車牌 OCR 時才需要安裝
 
 ## 注意事項
 
@@ -179,7 +262,6 @@ roi_config_polygon.json
 
 ## 後續可補強
 
-- 將主程式檔名縮短
 - 補上版本發布流程
-- 增加 `requirements-gpu.txt` / `requirements-cpu.txt`
+- 視部署需求補 `requirements-cpu.txt`
 - 補實際畫面截圖與範例輸出
