@@ -19,6 +19,10 @@ ENV_LPR_SVTR_CHARSET_PATH = "CCTV_ROI_LPR_SVTR_CHARSET_PATH"
 ENV_LPR_SVTR_INPUT_SIZE = "CCTV_ROI_LPR_SVTR_INPUT_SIZE"
 ENV_LPR_SVTR_BLANK_INDEX = "CCTV_ROI_LPR_SVTR_BLANK_INDEX"
 ENV_LPR_SVTR_PROVIDERS = "CCTV_ROI_LPR_SVTR_PROVIDERS"
+ENV_LPR_PADDLE_DEVICE = "CCTV_ROI_LPR_PADDLE_DEVICE"
+ENV_LPR_PADDLE_OCR_VERSION = "CCTV_ROI_LPR_PADDLE_OCR_VERSION"
+ENV_LPR_PADDLE_DET_MODEL_NAME = "CCTV_ROI_LPR_PADDLE_DET_MODEL_NAME"
+ENV_LPR_PADDLE_REC_MODEL_NAME = "CCTV_ROI_LPR_PADDLE_REC_MODEL_NAME"
 ENV_ULTRALYTICS_CONFIG_DIR = "YOLO_CONFIG_DIR"
 
 
@@ -66,6 +70,10 @@ def resolve_float_env(name: str, default: float) -> float:
     value = os.getenv(name)
     if not value:
         return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def resolve_int_env(name: str, default: int) -> int:
@@ -98,6 +106,10 @@ class AppConfig:
     lpr_svtr_input_size: str
     lpr_svtr_blank_index: int
     lpr_svtr_providers: str
+    lpr_paddle_device: str
+    lpr_paddle_ocr_version: str
+    lpr_paddle_det_model_name: str
+    lpr_paddle_rec_model_name: str
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -116,6 +128,10 @@ class AppConfig:
             lpr_svtr_input_size=os.getenv(ENV_LPR_SVTR_INPUT_SIZE, "48x160"),
             lpr_svtr_blank_index=resolve_int_env(ENV_LPR_SVTR_BLANK_INDEX, 0),
             lpr_svtr_providers=os.getenv(ENV_LPR_SVTR_PROVIDERS, "auto"),
+            lpr_paddle_device=os.getenv(ENV_LPR_PADDLE_DEVICE, ""),
+            lpr_paddle_ocr_version=os.getenv(ENV_LPR_PADDLE_OCR_VERSION, "PP-OCRv5"),
+            lpr_paddle_det_model_name=os.getenv(ENV_LPR_PADDLE_DET_MODEL_NAME, "PP-OCRv5_mobile_det"),
+            lpr_paddle_rec_model_name=os.getenv(ENV_LPR_PADDLE_REC_MODEL_NAME, "PP-OCRv5_mobile_rec"),
         )
 
 

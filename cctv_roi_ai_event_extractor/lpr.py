@@ -1,5 +1,6 @@
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from cctv_roi_ai_event_extractor.config import ensure_runtime_environment, load_config
@@ -216,6 +217,116 @@ class TesseractOcrEngine(OcrEngine):
         return text, 0.0
 
 
+def _mean_confidence(scores: list[float]) -> float:
+    valid_scores = [float(score) for score in scores if score is not None]
+    if not valid_scores:
+        return 0.0
+    return sum(valid_scores) / len(valid_scores)
+
+
+def _unwrap_paddle_result(result) -> Mapping | None:
+    if isinstance(result, Mapping):
+        data = result
+    elif hasattr(result, "res") and isinstance(result.res, Mapping):
+        data = result.res
+    else:
+        try:
+            data = dict(result)
+        except (TypeError, ValueError):
+            return None
+
+    nested = data.get("res")
+    if isinstance(nested, Mapping):
+        return nested
+    return data
+
+
+def _extract_paddle_v3_text(result) -> tuple[str, float]:
+    data = _unwrap_paddle_result(result)
+    if not data:
+        return "", 0.0
+
+    texts = data.get("rec_texts") or []
+    scores = data.get("rec_scores") or []
+    if not texts:
+        return "", 0.0
+
+    indexes = list(range(len(texts)))
+    boxes = data.get("rec_boxes")
+    if boxes is not None:
+        try:
+            indexes.sort(key=lambda idx: float(boxes[idx][0]))
+        except (IndexError, TypeError, ValueError):
+            pass
+
+    ordered_texts = [str(texts[idx]).strip() for idx in indexes if str(texts[idx]).strip()]
+    ordered_scores = []
+    for idx in indexes:
+        try:
+            ordered_scores.append(float(scores[idx]))
+        except (IndexError, TypeError, ValueError):
+            continue
+    return "".join(ordered_texts), _mean_confidence(ordered_scores)
+
+
+def _extract_paddle_legacy_text(results) -> tuple[str, float]:
+    candidates = []
+    for item in results or []:
+        if not isinstance(item, (list, tuple)):
+            continue
+        for line in item:
+            if not isinstance(line, (list, tuple)) or len(line) < 2:
+                continue
+            text_score = line[1]
+            if not isinstance(text_score, (list, tuple)) or len(text_score) < 2:
+                continue
+            text = str(text_score[0]).strip()
+            try:
+                score = float(text_score[1])
+            except (TypeError, ValueError):
+                score = 0.0
+            if text:
+                candidates.append((text, score))
+    if not candidates:
+        return "", 0.0
+    text = "".join(item[0] for item in candidates)
+    return text, _mean_confidence([item[1] for item in candidates])
+
+
+class PaddleOcrEngine(OcrEngine):
+    name = "paddleocr"
+
+    def __init__(self):
+        from paddleocr import PaddleOCR
+
+        config = load_config()
+        kwargs = {
+            "ocr_version": config.lpr_paddle_ocr_version,
+            "text_detection_model_name": config.lpr_paddle_det_model_name,
+            "text_recognition_model_name": config.lpr_paddle_rec_model_name,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+        }
+        if config.lpr_paddle_device:
+            kwargs["device"] = config.lpr_paddle_device
+
+        self.ocr = PaddleOCR(**kwargs)
+
+    def recognize(self, image_bgr) -> tuple[str, float]:
+        results = self.ocr.predict(image_bgr)
+        texts = []
+        confidences = []
+        for result in results or []:
+            text, confidence = _extract_paddle_v3_text(result)
+            if text:
+                texts.append(text)
+                confidences.append(confidence)
+        if texts:
+            return "".join(texts), _mean_confidence(confidences)
+        return _extract_paddle_legacy_text(results)
+
+
 def _parse_input_size(value: str) -> tuple[int, int]:
     clean = (value or "48x160").lower().replace(",", "x").replace(" ", "")
     parts = clean.split("x")
@@ -336,6 +447,8 @@ def create_ocr_engine(engine_name: str | None) -> OcrEngine:
     name = (engine_name or "none").strip().lower()
     if name in ("svtr", "transformer"):
         return SvtrOcrEngine()
+    if name in ("paddleocr", "paddle", "ppocr"):
+        return PaddleOcrEngine()
     if name == "easyocr":
         return EasyOcrEngine()
     if name in ("tesseract", "pytesseract"):

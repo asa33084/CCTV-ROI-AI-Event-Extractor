@@ -3,8 +3,7 @@ import os
 import sys
 from datetime import datetime
 
-import cv2
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, Signal
+from PySide6.QtCore import QLibraryInfo, QObject, QPointF, QRectF, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
@@ -38,6 +37,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))
+
+import cv2
+
 from cctv_roi_ai_event_extractor.core import (
     APP_VERSION,
     ObjectDetector,
@@ -60,6 +63,19 @@ from cctv_roi_ai_event_extractor.core import (
 )
 from cctv_roi_ai_event_extractor.config import load_config
 from cctv_roi_ai_event_extractor.evidence_report import write_evidence_workbook
+
+
+LPR_OCR_CHOICES = (
+    ("PaddleOCR（PP-OCRv5）", "paddleocr"),
+    ("SVTR / ONNX", "svtr"),
+)
+
+
+def normalize_selectable_lpr_ocr_engine(engine_name: str | None) -> str:
+    name = (engine_name or "").strip().lower()
+    if name in {"svtr", "transformer"}:
+        return "svtr"
+    return "paddleocr"
 
 
 def write_csv_log(logs_root: str, rows):
@@ -541,7 +557,7 @@ class MainWindow(QMainWindow):
         app_config = load_config()
         self.lpr_enabled = app_config.lpr_enabled
         self.lpr_plate_model_path = app_config.lpr_plate_model_path or os.path.join(self.app_dir, "models", "license_plate_yolo.pt")
-        self.lpr_ocr_engine = app_config.lpr_ocr_engine
+        self.lpr_ocr_engine = normalize_selectable_lpr_ocr_engine(app_config.lpr_ocr_engine)
         self.lpr_confidence = app_config.lpr_confidence
 
         self.confidence = 0.4
@@ -699,6 +715,14 @@ class MainWindow(QMainWindow):
         self.chk_lpr = QCheckBox("車牌辨識")
         self.chk_lpr.setChecked(self.lpr_enabled)
         option_row.addWidget(self.chk_lpr)
+
+        option_row.addWidget(QLabel("OCR："))
+        self.cmb_lpr_ocr = QComboBox()
+        for label, value in LPR_OCR_CHOICES:
+            self.cmb_lpr_ocr.addItem(label, value)
+        selected_ocr_index = self.cmb_lpr_ocr.findData(self.lpr_ocr_engine)
+        self.cmb_lpr_ocr.setCurrentIndex(max(0, selected_ocr_index))
+        option_row.addWidget(self.cmb_lpr_ocr)
         option_row.addStretch(1)
 
         action_row = QHBoxLayout()
@@ -741,7 +765,7 @@ class MainWindow(QMainWindow):
             "Polygon ROI 操作：左鍵加點、右鍵刪點、清空、確認。\n"
             "邏輯說明：偵測 person / car / motorcycle / bus / truck，只有當目標的底部中心點進入 Polygon ROI，且連續達到門檻幀數，才算事件開始。\n"
             "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段仍輸出原始影片。"
-            "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可用 none / easyocr / tesseract。"
+            "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可在 PaddleOCR 或 SVTR / ONNX 二選一。"
         )
         layout.addWidget(help_text)
 
@@ -1046,6 +1070,8 @@ class MainWindow(QMainWindow):
             self.btn_remove_selected_source,
             self.btn_clear_input,
             self.lst_sources,
+            self.chk_lpr,
+            self.cmb_lpr_ocr,
             self.btn_start,
         ):
             widget.setEnabled(enabled)
@@ -1160,6 +1186,7 @@ class MainWindow(QMainWindow):
             self.detector = ObjectDetector(self.model_path, conf=self.confidence, detect_width=self.detect_width, device=self.device)
             self.lpr_pipeline = None
             if self.chk_lpr.isChecked():
+                self.lpr_ocr_engine = self.cmb_lpr_ocr.currentData() or "paddleocr"
                 if not os.path.exists(self.lpr_plate_model_path):
                     QMessageBox.critical(
                         self,
@@ -1266,7 +1293,7 @@ class MainWindow(QMainWindow):
             f"Draw ROI on Screenshot: {self.chk_draw_roi.isChecked()}\n"
             f"LPR Enabled: {self.chk_lpr.isChecked()}\n"
             f"LPR Plate Model Path: {self.lpr_plate_model_path if self.chk_lpr.isChecked() else ''}\n"
-            f"LPR OCR Engine: {self.lpr_ocr_engine if self.chk_lpr.isChecked() else ''}\n"
+            f"LPR OCR Engine: {self.cmb_lpr_ocr.currentData() if self.chk_lpr.isChecked() else ''}\n"
             f"LPR Confidence: {self.lpr_confidence if self.chk_lpr.isChecked() else ''}\n"
             f"Total Videos Found: {result['total_videos']}\n"
             f"Success Videos: {result['success_count']}\n"

@@ -1,6 +1,9 @@
 -r requirements.txt
---index-url https://download.pytorch.org/whl/cu128
+--index-url https://download.pytorch.org/whl/cu126
 --extra-index-url https://pypi.org/simple
 torch==2.9.1
 torchvision==0.24.1
 torchaudio==2.9.1
+
+# PaddleOCR is included by requirements.txt.
+# If you intentionally use PaddlePaddle GPU in this same env, install it with --no-deps.
