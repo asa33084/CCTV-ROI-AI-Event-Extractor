@@ -71,8 +71,10 @@ except Exception:
 
 
 LONG_STAY_SCREENSHOT_INTERVAL_SEC = load_config().long_stay_screenshot_interval_sec
-LPR_AGGREGATION_WINDOW_SEC = 1.5
-LPR_DUPLICATE_SUPPRESS_SEC = 8.0
+LPR_AGGREGATION_WINDOW_SEC = 20.0
+LPR_DUPLICATE_SUPPRESS_SEC = 20.0
+LPR_LOCATION_SUPPRESS_SEC = 60.0
+LPR_LOCATION_IOU_THRESHOLD = 0.10
 
 
 # ---------------------------
@@ -694,7 +696,7 @@ def plate_texts_similar(a, b):
 def plate_recognitions_match(left, right):
     if plate_texts_similar(left.text, right.text):
         return True
-    return bbox_iou(left.bbox, right.bbox) >= 0.25
+    return bbox_iou(left.bbox, right.bbox) >= LPR_LOCATION_IOU_THRESHOLD
 
 
 def plate_recognition_quality(item):
@@ -1081,11 +1083,15 @@ def process_video(
     use_detection_roi_lpr = lpr_pipeline is not None
     lpr_pending_groups = []
     lpr_suppressed_until = {}
+    lpr_suppressed_locations = []
 
     def flush_lpr_group(group):
         nonlocal grabbed_count
-        record = group["record"]
-        recognition = group["recognition"]
+        best_candidate = select_lpr_group_candidate(group)
+        if best_candidate is None:
+            return
+        record = best_candidate["record"]
+        recognition = best_candidate["recognition"]
         shot_path = ""
         ok_save = False
         if export_screenshots:
@@ -1126,6 +1132,10 @@ def process_video(
             })
 
         lpr_suppressed_until[recognition.text] = record["time_sec"] + LPR_DUPLICATE_SUPPRESS_SEC
+        lpr_suppressed_locations.append({
+            "bbox": recognition.bbox,
+            "until": record["time_sec"] + LPR_LOCATION_SUPPRESS_SEC,
+        })
         if status_cb:
             if export_screenshots and ok_save:
                 status_cb(f"[LPR] 偵測區車輛辨識：{recognition.text} | {os.path.basename(shot_path)}")
@@ -1142,16 +1152,54 @@ def process_video(
         lpr_pending_groups[:] = remaining
 
     def is_lpr_text_suppressed(text, time_sec):
+        expired_texts = [
+            suppressed_text
+            for suppressed_text, suppress_until in lpr_suppressed_until.items()
+            if suppress_until <= time_sec
+        ]
+        for suppressed_text in expired_texts:
+            lpr_suppressed_until.pop(suppressed_text, None)
         for suppressed_text, suppress_until in lpr_suppressed_until.items():
             if suppress_until > time_sec and plate_texts_similar(text, suppressed_text):
                 return True
         return False
+
+    def is_lpr_location_suppressed(bbox, time_sec):
+        active_locations = []
+        suppressed = False
+        for item in lpr_suppressed_locations:
+            if item["until"] <= time_sec:
+                continue
+            active_locations.append(item)
+            if bbox_iou(bbox, item["bbox"]) >= LPR_LOCATION_IOU_THRESHOLD:
+                suppressed = True
+        lpr_suppressed_locations[:] = active_locations
+        return suppressed
+
+    def select_lpr_group_candidate(group):
+        candidates = group.get("candidates") or []
+        if not candidates:
+            return None
+
+        text_scores = {}
+        for candidate in candidates:
+            text = candidate["recognition"].text
+            text_scores[text] = text_scores.get(text, 0.0) + 2.0 + candidate["quality"]
+
+        best_text = max(text_scores, key=text_scores.get)
+        best_candidates = [
+            candidate for candidate in candidates
+            if candidate["recognition"].text == best_text
+        ]
+        return max(best_candidates, key=lambda candidate: candidate["quality"])
 
     def queue_lpr_recognitions(recognitions, frame, detections, frame_idx_value, time_sec):
         for recognition in recognitions:
             if not recognition.text:
                 continue
             if is_lpr_text_suppressed(recognition.text, time_sec):
+                continue
+            if is_lpr_location_suppressed(recognition.bbox, time_sec):
                 continue
 
             matching_group = None
@@ -1167,6 +1215,11 @@ def process_video(
                 "time_sec": time_sec,
             }
             quality = plate_recognition_quality(recognition)
+            candidate = {
+                "recognition": recognition,
+                "quality": quality,
+                "record": record,
+            }
             if matching_group is None:
                 lpr_pending_groups.append({
                     "first_seen_sec": time_sec,
@@ -1174,10 +1227,12 @@ def process_video(
                     "recognition": recognition,
                     "quality": quality,
                     "record": record,
+                    "candidates": [candidate],
                 })
                 continue
 
             matching_group["last_seen_sec"] = time_sec
+            matching_group.setdefault("candidates", []).append(candidate)
             if quality > matching_group["quality"]:
                 matching_group["recognition"] = recognition
                 matching_group["quality"] = quality

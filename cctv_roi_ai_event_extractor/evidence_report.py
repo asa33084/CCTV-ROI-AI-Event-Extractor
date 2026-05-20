@@ -52,9 +52,89 @@ def _first_existing_path(paths):
     return None
 
 
+def _parse_seconds(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_bbox(value):
+    try:
+        parts = [int(float(part.strip())) for part in str(value or "").split(",")]
+    except (TypeError, ValueError):
+        return None
+    if len(parts) != 4:
+        return None
+    return tuple(parts)
+
+
+def _bbox_iou(a, b):
+    if not a or not b:
+        return 0.0
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / float(union) if union > 0 else 0.0
+
+
+def _plate_row_score(item):
+    try:
+        confidence = max(float(part) for part in str(item.get("plate_confidence", "0")).split(";") if part)
+    except ValueError:
+        confidence = 0.0
+    valid_bonus = 1.0 if "Y" in str(item.get("plate_valid_taiwan_format", "")) else 0.0
+    text = str(item.get("plate_text", ""))
+    length_bonus = 0.2 if 4 <= len(text) <= 8 else -1.0
+    return valid_bonus + confidence + length_bonus
+
+
+def _select_best_lpr_row(group):
+    text_scores = {}
+    for item in group:
+        text = str(item.get("plate_text", ""))
+        text_scores[text] = text_scores.get(text, 0.0) + 2.0 + _plate_row_score(item)
+    best_text = max(text_scores, key=text_scores.get)
+    best_rows = [item for item in group if str(item.get("plate_text", "")) == best_text]
+    return max(best_rows, key=_plate_row_score)
+
+
+def _dedupe_lpr_rows(rows):
+    groups = []
+    for row in sorted(rows, key=lambda item: _parse_seconds(item.get("event_time_sec"))):
+        row_bbox = _parse_bbox(row.get("plate_bbox"))
+        row_time = _parse_seconds(row.get("event_time_sec"))
+        matched_index = None
+        for idx, group in enumerate(groups):
+            if row.get("video_rel_path") != group[0].get("video_rel_path"):
+                continue
+            group_times = [_parse_seconds(existing.get("event_time_sec")) for existing in group]
+            if min(abs(row_time - existing_time) for existing_time in group_times) > 60.0:
+                continue
+            if any(_bbox_iou(row_bbox, _parse_bbox(existing.get("plate_bbox"))) >= 0.10 for existing in group):
+                matched_index = idx
+                break
+        if matched_index is None:
+            groups.append([row])
+        else:
+            groups[matched_index].append(row)
+    return [_select_best_lpr_row(group) for group in groups]
+
+
 def build_evidence_rows(csv_rows):
     rows = []
-    for item in csv_rows:
+    lpr_rows = [item for item in csv_rows if item.get("record_type") == "lpr_detection" and item.get("plate_text")]
+    screenshot_rows = [item for item in csv_rows if item.get("record_type") == "screenshot"]
+    for item in _dedupe_lpr_rows(lpr_rows) + screenshot_rows:
         record_type = item.get("record_type")
         if record_type not in {"screenshot", "lpr_detection"}:
             continue
