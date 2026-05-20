@@ -309,13 +309,14 @@ class PaddleOcrEngine(OcrEngine):
 
         config = load_config()
         kwargs = {
-            "ocr_version": config.lpr_paddle_ocr_version,
             "text_detection_model_name": config.lpr_paddle_det_model_name,
             "text_recognition_model_name": config.lpr_paddle_rec_model_name,
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_textline_orientation": False,
         }
+        if not config.lpr_paddle_det_model_name and not config.lpr_paddle_rec_model_name:
+            kwargs["ocr_version"] = config.lpr_paddle_ocr_version
         if config.lpr_paddle_device:
             kwargs["device"] = config.lpr_paddle_device
 
