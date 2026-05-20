@@ -19,6 +19,7 @@ from cctv_roi_ai_event_extractor.event_processing import (
     is_subpath,
     list_available_compute_devices,
     load_roi_config,
+    load_roi_regions,
     norm_path,
     point_in_polygon,
     polygon_bbox,
@@ -29,6 +30,7 @@ from cctv_roi_ai_event_extractor.event_processing import (
     safe_relpath,
     save_frame,
     save_roi_config,
+    save_roi_regions,
     try_save_screenshot,
 )
 from cctv_roi_ai_event_extractor.lpr import (
@@ -63,6 +65,7 @@ __all__ = [
     "is_subpath",
     "list_available_compute_devices",
     "load_roi_config",
+    "load_roi_regions",
     "norm_path",
     "point_in_polygon",
     "polygon_bbox",
@@ -73,6 +76,7 @@ __all__ = [
     "safe_relpath",
     "save_frame",
     "save_roi_config",
+    "save_roi_regions",
     "try_save_screenshot",
     "LicensePlateRecognizer",
     "normalize_taiwan_plate_text",

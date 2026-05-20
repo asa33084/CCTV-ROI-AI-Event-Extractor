@@ -53,13 +53,13 @@ from cctv_roi_ai_event_extractor.core import (
     get_auto_device_info,
     is_subpath,
     list_available_compute_devices,
-    load_roi_config,
+    load_roi_regions,
     norm_path,
     polygon_bbox,
     process_video,
     resolve_default_model_path,
     safe_relpath,
-    save_roi_config,
+    save_roi_regions,
 )
 from cctv_roi_ai_event_extractor.config import load_config
 from cctv_roi_ai_event_extractor.evidence_report import write_evidence_workbook
@@ -364,9 +364,9 @@ class PolygonRoiView(QGraphicsView):
 
 
 class PolygonRoiDialog(QDialog):
-    def __init__(self, video_path, preset_polygon=None, parent=None):
+    def __init__(self, video_path, preset_polygon=None, parent=None, title="Polygon ROI 選取", description=None):
         super().__init__(parent)
-        self.setWindowTitle("Polygon ROI 選取")
+        self.setWindowTitle(title)
         self.setModal(True)
         self.resize(1400, 900)
         self.result_polygon = None
@@ -378,7 +378,7 @@ class PolygonRoiDialog(QDialog):
             raise ValueError("無法讀取 ROI 預覽影片的第一幀。")
 
         layout = QVBoxLayout(self)
-        info = QLabel("請在畫面上點選 Polygon ROI 節點。至少需要 3 點。")
+        info = QLabel(description or "請在畫面上點選 Polygon ROI 節點。至少需要 3 點。")
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -475,6 +475,8 @@ class BatchWorker(QObject):
                     export_clips=self.config["export_clips"],
                     detect_every_n_frames=self.config["detect_every_n_frames"],
                     lpr_pipeline=self.config.get("lpr_pipeline"),
+                    touch_polygon=self.config.get("touch_polygon"),
+                    export_long_stay_screenshots=self.config.get("export_long_stay_screenshots", True),
                     progress_cb=lambda frame_idx, total_frames: self.frame_progress.emit(frame_idx, total_frames),
                     status_cb=self.status_changed.emit,
                     stop_checker=lambda: self.stop_requested,
@@ -542,6 +544,7 @@ class MainWindow(QMainWindow):
         self.input_mode = "folder"
 
         self.polygon = None
+        self.touch_polygon = None
         self.excluded_dir = None
         self.screenshots_root = None
         self.clips_root = None
@@ -689,9 +692,13 @@ class MainWindow(QMainWindow):
         self.lbl_found = QLabel("找到影片數：尚未掃描")
         layout.addWidget(self.lbl_found)
 
-        self.lbl_roi = QLabel("Polygon ROI：尚未選取")
+        self.lbl_roi = QLabel("偵測區 Polygon ROI：尚未選取")
         self.lbl_roi.setWordWrap(True)
         layout.addWidget(self.lbl_roi)
+
+        self.lbl_touch_roi = QLabel("觸碰區 Polygon ROI：尚未選取")
+        self.lbl_touch_roi.setWordWrap(True)
+        layout.addWidget(self.lbl_touch_roi)
 
         self.lbl_ai = QLabel()
         self.lbl_ai.setWordWrap(True)
@@ -703,6 +710,10 @@ class MainWindow(QMainWindow):
         self.chk_export_screenshots = QCheckBox("輸出截圖")
         self.chk_export_screenshots.setChecked(True)
         option_row.addWidget(self.chk_export_screenshots)
+
+        self.chk_long_stay_screenshots = QCheckBox("長時間停留補抓截圖")
+        self.chk_long_stay_screenshots.setChecked(True)
+        option_row.addWidget(self.chk_long_stay_screenshots)
 
         self.chk_export_clips = QCheckBox("輸出事件片段")
         self.chk_export_clips.setChecked(True)
@@ -763,7 +774,7 @@ class MainWindow(QMainWindow):
         help_text.setPlainText(
             "來源選擇：可設為單一資料夾、累加多個資料夾、設為單一影片，或一次設為多個影片；也可在清單中多選後移除。\n"
             "Polygon ROI 操作：左鍵加點、右鍵刪點、清空、確認。\n"
-            "邏輯說明：偵測 person / car / motorcycle / bus / truck，只有當目標的底部中心點進入 Polygon ROI，且連續達到門檻幀數，才算事件開始。\n"
+            "邏輯說明：偵測區控制事件起訖；啟用車牌辨識時，車輛 bbox 碰到觸碰區後，才會使用偵測區內暫存的最佳候選影像做 LPR。\n"
             "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段仍輸出原始影片。"
             "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可在 PaddleOCR 或 SVTR / ONNX 二選一。"
         )
@@ -1072,6 +1083,7 @@ class MainWindow(QMainWindow):
             self.lst_sources,
             self.chk_lpr,
             self.cmb_lpr_ocr,
+            self.chk_long_stay_screenshots,
             self.btn_start,
         ):
             widget.setEnabled(enabled)
@@ -1135,17 +1147,32 @@ class MainWindow(QMainWindow):
             self.set_status("待命")
             return
 
-        saved_polygon = load_roi_config(self.app_dir)
+        saved_regions = load_roi_regions(self.app_dir)
+        saved_polygon = saved_regions.get("detection_polygon")
+        saved_touch_polygon = saved_regions.get("touch_polygon")
         preset_polygon = None
+        preset_touch_polygon = None
         if saved_polygon:
-            result = QMessageBox.question(self, "載入既有 Polygon ROI", f"偵測到先前已儲存 Polygon ROI，共 {len(saved_polygon)} 點。\n\n是否沿用並可再調整？")
+            touch_text = f"\n觸碰區：{len(saved_touch_polygon)} 點" if saved_touch_polygon else "\n觸碰區：尚未儲存"
+            result = QMessageBox.question(
+                self,
+                "載入既有 Polygon ROI",
+                f"偵測到先前已儲存偵測區 Polygon ROI，共 {len(saved_polygon)} 點。{touch_text}\n\n是否沿用並可再調整？",
+            )
             if result == QMessageBox.StandardButton.Yes:
                 preset_polygon = saved_polygon
+                preset_touch_polygon = saved_touch_polygon
 
-        self.set_status(f"Polygon ROI 框選中：{safe_relpath(readable_video, self.input_dir)}")
+        self.set_status(f"偵測區 Polygon ROI 框選中：{safe_relpath(readable_video, self.input_dir)}")
 
         try:
-            picker = PolygonRoiDialog(readable_video, preset_polygon=preset_polygon, parent=self)
+            picker = PolygonRoiDialog(
+                readable_video,
+                preset_polygon=preset_polygon,
+                parent=self,
+                title="偵測區 Polygon ROI 選取",
+                description="請框選較大的偵測區。事件起訖與候選影像都會依此區域判斷，至少需要 3 點。",
+            )
         except Exception as e:
             QMessageBox.critical(self, "ROI 預覽失敗", str(e))
             self.set_status("待命")
@@ -1157,8 +1184,30 @@ class MainWindow(QMainWindow):
 
         self.polygon = picker.result_polygon
         bx, by, bw, bh = polygon_bbox(self.polygon)
-        self.lbl_roi.setText(f"Polygon ROI：{len(self.polygon)} 點 | 外接框 X={bx} Y={by} W={bw} H={bh}")
-        save_roi_config(self.app_dir, self.polygon)
+        self.lbl_roi.setText(f"偵測區 Polygon ROI：{len(self.polygon)} 點 | 外接框 X={bx} Y={by} W={bw} H={bh}")
+
+        self.set_status(f"觸碰區 Polygon ROI 框選中：{safe_relpath(readable_video, self.input_dir)}")
+        try:
+            touch_picker = PolygonRoiDialog(
+                readable_video,
+                preset_polygon=preset_touch_polygon,
+                parent=self,
+                title="觸碰區 Polygon ROI 選取",
+                description="請框選較後方的觸碰區。車輛 track 的 bbox 碰到此區後，才會用偵測區內暫存的最佳候選影像做車牌辨識。",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "ROI 預覽失敗", str(e))
+            self.set_status("待命")
+            return
+
+        if touch_picker.exec() != QDialog.DialogCode.Accepted or not touch_picker.result_polygon:
+            self.set_status("待命")
+            return
+
+        self.touch_polygon = touch_picker.result_polygon
+        tbx, tby, tbw, tbh = polygon_bbox(self.touch_polygon)
+        self.lbl_touch_roi.setText(f"觸碰區 Polygon ROI：{len(self.touch_polygon)} 點 | 外接框 X={tbx} Y={tby} W={tbw} H={tbh}")
+        save_roi_regions(self.app_dir, self.polygon, self.touch_polygon)
 
         params = self.ask_all_params()
         if not params:
@@ -1219,6 +1268,7 @@ class MainWindow(QMainWindow):
             "screenshots_root": self.screenshots_root,
             "clips_root": self.clips_root,
             "polygon": self.polygon,
+            "touch_polygon": self.touch_polygon,
             "detector": self.detector,
             "start_trigger_frames": self.start_trigger_frames,
             "end_hold_sec": self.end_hold_sec,
@@ -1226,6 +1276,7 @@ class MainWindow(QMainWindow):
             "post_event_sec": self.post_event_sec,
             "draw_roi_on_screenshot": self.chk_draw_roi.isChecked(),
             "export_screenshots": self.chk_export_screenshots.isChecked(),
+            "export_long_stay_screenshots": self.chk_long_stay_screenshots.isChecked(),
             "export_clips": self.chk_export_clips.isChecked(),
             "detect_every_n_frames": self.detect_every_n_frames,
             "lpr_pipeline": self.lpr_pipeline,
@@ -1269,6 +1320,10 @@ class MainWindow(QMainWindow):
         if self.polygon:
             bx, by, bw, bh = polygon_bbox(self.polygon)
             bbox_text = f"X={bx} Y={by} W={bw} H={bh}"
+        touch_bbox_text = "N/A"
+        if self.touch_polygon:
+            tbx, tby, tbw, tbh = polygon_bbox(self.touch_polygon)
+            touch_bbox_text = f"X={tbx} Y={tby} W={tbw} H={tbh}"
 
         summary_text = (
             f"Tool Name: CCTV ROI AI Event Extractor (Polygon ROI, Qt)\n"
@@ -1279,8 +1334,10 @@ class MainWindow(QMainWindow):
             f"AI Device: {self.device}\n"
             f"AI Device Name: {self.device_info['name']}\n"
             f"Excluded Output Root: {self.excluded_dir}\n"
-            f"Polygon Point Count: {len(self.polygon) if self.polygon else 0}\n"
-            f"Polygon Bounding Box: {bbox_text}\n"
+            f"Detection Polygon Point Count: {len(self.polygon) if self.polygon else 0}\n"
+            f"Detection Polygon Bounding Box: {bbox_text}\n"
+            f"Touch Polygon Point Count: {len(self.touch_polygon) if self.touch_polygon else 0}\n"
+            f"Touch Polygon Bounding Box: {touch_bbox_text}\n"
             f"Confidence: {self.confidence}\n"
             f"Start Trigger Frames: {self.start_trigger_frames}\n"
             f"End Hold Sec: {self.end_hold_sec}\n"
@@ -1289,6 +1346,7 @@ class MainWindow(QMainWindow):
             f"Detect Width: {self.detect_width}\n"
             f"Detect Every N Frames: {self.detect_every_n_frames}\n"
             f"Export Screenshots: {self.chk_export_screenshots.isChecked()}\n"
+            f"Long Stay Screenshots: {self.chk_long_stay_screenshots.isChecked()}\n"
             f"Export Clips: {self.chk_export_clips.isChecked()}\n"
             f"Draw ROI on Screenshot: {self.chk_draw_roi.isChecked()}\n"
             f"LPR Enabled: {self.chk_lpr.isChecked()}\n"

@@ -269,7 +269,10 @@ def is_subpath(child_path: str, parent_path: str) -> bool:
 
 def safe_relpath(full_path: str, base_dir: str) -> str:
     try:
-        return os.path.relpath(full_path, base_dir)
+        rel_path = os.path.relpath(full_path, base_dir)
+        if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep) or os.path.isabs(rel_path):
+            return os.path.basename(full_path)
+        return rel_path
     except Exception:
         return os.path.basename(full_path)
 
@@ -285,34 +288,55 @@ def get_roi_config_path(app_dir: str) -> str:
 
 
 def load_roi_config(app_dir: str):
+    regions = load_roi_regions(app_dir)
+    return regions.get("detection_polygon")
+
+
+def _clean_polygon(polygon):
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        return None
+
+    clean_points = []
+    for pt in polygon:
+        if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+            return None
+        x, y = pt
+        if not isinstance(x, int) or not isinstance(y, int):
+            return None
+        clean_points.append((x, y))
+    return clean_points
+
+
+def load_roi_regions(app_dir: str):
     path = get_roi_config_path(app_dir)
     if not os.path.exists(path):
-        return None
+        return {"detection_polygon": None, "touch_polygon": None}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        polygon = data.get("polygon")
-        if not isinstance(polygon, list) or len(polygon) < 3:
-            return None
-
-        clean_points = []
-        for pt in polygon:
-            if not isinstance(pt, (list, tuple)) or len(pt) != 2:
-                return None
-            x, y = pt
-            if not isinstance(x, int) or not isinstance(y, int):
-                return None
-            clean_points.append((x, y))
-        return clean_points
+        detection_polygon = _clean_polygon(data.get("detection_polygon"))
+        if detection_polygon is None:
+            detection_polygon = _clean_polygon(data.get("polygon"))
+        touch_polygon = _clean_polygon(data.get("touch_polygon"))
+        return {
+            "detection_polygon": detection_polygon,
+            "touch_polygon": touch_polygon,
+        }
     except Exception:
-        return None
+        return {"detection_polygon": None, "touch_polygon": None}
 
 
 def save_roi_config(app_dir: str, polygon):
+    save_roi_regions(app_dir, polygon, None)
+
+
+def save_roi_regions(app_dir: str, detection_polygon, touch_polygon=None):
     path = get_roi_config_path(app_dir)
     data = {
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "polygon": [[int(x), int(y)] for x, y in polygon]
+        "polygon": [[int(x), int(y)] for x, y in detection_polygon],
+        "detection_polygon": [[int(x), int(y)] for x, y in detection_polygon],
+        "touch_polygon": [[int(x), int(y)] for x, y in touch_polygon] if touch_polygon else None,
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -597,10 +621,119 @@ def point_in_polygon(point, polygon_np):
     return result >= 0
 
 
+def bbox_area(bbox):
+    x1, y1, x2, y2 = bbox
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def bbox_iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    inter = bbox_area((ix1, iy1, ix2, iy2))
+    if inter <= 0:
+        return 0.0
+    union = bbox_area(a) + bbox_area(b) - inter
+    if union <= 0:
+        return 0.0
+    return inter / float(union)
+
+
+def crop_bbox_from_frame(frame, bbox):
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, min(w - 1, int(x1)))
+    y1 = max(0, min(h - 1, int(y1)))
+    x2 = max(0, min(w, int(x2)))
+    y2 = max(0, min(h, int(y2)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame[y1:y2, x1:x2].copy()
+
+
+def make_polygon_mask(frame_shape, polygon):
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if polygon and len(polygon) >= 3:
+        pts = np.array(polygon, dtype=np.int32)
+        cv2.fillPoly(mask, [pts], 255)
+    return mask
+
+
+def bbox_intersects_mask(bbox, mask):
+    if mask is None:
+        return False
+    h, w = mask.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, min(w - 1, int(x1)))
+    y1 = max(0, min(h - 1, int(y1)))
+    x2 = max(0, min(w - 1, int(x2)))
+    y2 = max(0, min(h - 1, int(y2)))
+    if x2 < x1 or y2 < y1:
+        return False
+    return bool(np.any(mask[y1:y2 + 1, x1:x2 + 1]))
+
+
+class SimpleIouTracker:
+    def __init__(self, iou_threshold=0.25, max_missed=8):
+        self.iou_threshold = float(iou_threshold)
+        self.max_missed = int(max_missed)
+        self.next_id = 1
+        self.tracks = {}
+
+    def update(self, detections):
+        for track in self.tracks.values():
+            track["matched"] = False
+            track["missed"] += 1
+
+        tracked_detections = []
+        for det in detections:
+            best_id = None
+            best_iou = 0.0
+            for track_id, track in self.tracks.items():
+                if track["matched"]:
+                    continue
+                if track["class_name"] != det["class_name"]:
+                    continue
+                score = bbox_iou(track["bbox"], det["bbox"])
+                if score > best_iou:
+                    best_iou = score
+                    best_id = track_id
+
+            if best_id is None or best_iou < self.iou_threshold:
+                best_id = self.next_id
+                self.next_id += 1
+
+            self.tracks[best_id] = {
+                "bbox": det["bbox"],
+                "class_name": det["class_name"],
+                "matched": True,
+                "missed": 0,
+            }
+            det_with_track = dict(det)
+            det_with_track["track_id"] = best_id
+            tracked_detections.append(det_with_track)
+
+        stale_ids = [
+            track_id
+            for track_id, track in self.tracks.items()
+            if track["missed"] > self.max_missed
+        ]
+        for track_id in stale_ids:
+            self.tracks.pop(track_id, None)
+
+        return tracked_detections
+
+
 def draw_detection(frame, det, inside=True):
     x1, y1, x2, y2 = det["bbox"]
     color = (0, 255, 0) if inside else (0, 165, 255)
     label = f'{det["class_name"]} {det["score"]:.2f}'
+    if det.get("track_id") is not None:
+        label += f' #{det["track_id"]}'
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     cv2.putText(frame, label, (x1, max(25, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -611,17 +744,17 @@ def draw_anchor_point(frame, point, inside):
     cv2.circle(frame, point, 5, color, -1)
 
 
-def draw_polygon_overlay(frame, polygon):
+def draw_polygon_overlay(frame, polygon, color=(255, 255, 0), fill_color=(0, 255, 255)):
     out = frame.copy()
     if len(polygon) >= 3:
         overlay = out.copy()
         pts = np.array(polygon, dtype=np.int32)
-        cv2.fillPoly(overlay, [pts], (0, 255, 255))
+        cv2.fillPoly(overlay, [pts], fill_color)
         out = cv2.addWeighted(overlay, 0.15, out, 0.85, 0)
-        cv2.polylines(out, [pts], True, (255, 255, 0), 2)
+        cv2.polylines(out, [pts], True, color, 2)
     elif len(polygon) >= 2:
         pts = np.array(polygon, dtype=np.int32)
-        cv2.polylines(out, [pts], False, (255, 255, 0), 2)
+        cv2.polylines(out, [pts], False, color, 2)
     return out
 
 
@@ -635,12 +768,14 @@ def polygon_bbox(polygon):
     return x, y, w, h
 
 
-def build_screenshot_frame(frame, detections, polygon, polygon_np, draw_roi_on_screenshot, plate_recognitions=None):
+def build_screenshot_frame(frame, detections, polygon, polygon_np, draw_roi_on_screenshot, plate_recognitions=None, touch_polygon=None):
     if not draw_roi_on_screenshot:
         annotated = frame.copy()
         return draw_plate_recognitions(annotated, plate_recognitions)
 
     annotated = draw_polygon_overlay(frame.copy(), polygon)
+    if touch_polygon:
+        annotated = draw_polygon_overlay(annotated, touch_polygon, color=(255, 0, 255), fill_color=(255, 0, 255))
     for det in detections:
         anchor = get_bottom_center(det["bbox"])
         inside = point_in_polygon(anchor, polygon_np)
@@ -651,9 +786,12 @@ def build_screenshot_frame(frame, detections, polygon, polygon_np, draw_roi_on_s
 
 
 def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, frame_idx, current_time_sec,
-                        frame, detections, polygon, polygon_np, draw_roi_on_screenshot, lpr_pipeline=None):
+                        frame, detections, polygon, polygon_np, draw_roi_on_screenshot, lpr_pipeline=None,
+                        touch_polygon=None, record_type="screenshot", plate_recognitions_override=None):
     plate_recognitions = []
-    if lpr_pipeline is not None:
+    if plate_recognitions_override is not None:
+        plate_recognitions = plate_recognitions_override
+    elif lpr_pipeline is not None:
         plate_recognitions = lpr_pipeline.recognize(frame, vehicle_detections=detections)
 
     screenshot_frame = build_screenshot_frame(
@@ -662,7 +800,8 @@ def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, fra
         polygon=polygon,
         polygon_np=polygon_np,
         draw_roi_on_screenshot=draw_roi_on_screenshot,
-        plate_recognitions=plate_recognitions,
+        plate_recognitions=[] if record_type == "lpr_touch" else plate_recognitions,
+        touch_polygon=touch_polygon,
     )
 
     ok_save, shot_path = save_frame(
@@ -674,7 +813,7 @@ def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, fra
     )
 
     logs.append({
-        "type": "screenshot",
+        "type": record_type,
         "video_rel_path": rel_video_path,
         "event_time_sec": f"{current_time_sec:.2f}",
         "interval_start_sec": "",
@@ -805,6 +944,8 @@ def process_video(
     export_clips: bool,
     detect_every_n_frames: int,
     lpr_pipeline=None,
+    touch_polygon=None,
+    export_long_stay_screenshots: bool = True,
     progress_cb=None,
     status_cb=None,
     stop_checker=None
@@ -873,6 +1014,8 @@ def process_video(
 
     event_intervals = []
     polygon_np = np.array(polygon, dtype=np.int32)
+    touch_mask = None
+    use_touch_lpr = lpr_pipeline is not None and touch_polygon is not None and len(touch_polygon) >= 3
 
     in_event = False
     event_start_frame = None
@@ -882,6 +1025,9 @@ def process_video(
     cached_detections = []
     cached_inside_present = False
     next_long_stay_shot_frame = None
+    tracker = SimpleIouTracker(max_missed=max(4, start_trigger_frames * 2)) if use_touch_lpr else None
+    vehicle_candidates = {}
+    lpr_completed_track_ids = set()
 
     while True:
         if stop_checker and stop_checker():
@@ -916,19 +1062,122 @@ def process_video(
         should_detect = ((frame_idx - 1) % detect_every_n_frames == 0)
 
         if should_detect:
-            cached_detections = detector.detect(frame)
+            raw_detections = detector.detect(frame)
+            if use_touch_lpr:
+                vehicle_detections = [
+                    det for det in raw_detections
+                    if det["class_name"] in {"car", "motorcycle", "bus", "truck"}
+                ]
+                tracked_vehicles = tracker.update(vehicle_detections)
+                tracked_by_bbox = {det["bbox"]: det for det in tracked_vehicles}
+                active_track_ids = set(tracker.tracks)
+                for stale_track_id in list(vehicle_candidates):
+                    if stale_track_id not in active_track_ids:
+                        vehicle_candidates.pop(stale_track_id, None)
+                cached_detections = []
+                for det in raw_detections:
+                    tracked = tracked_by_bbox.get(det["bbox"])
+                    cached_detections.append(tracked if tracked is not None else det)
+            else:
+                cached_detections = raw_detections
 
             inside_count = 0
             for det in cached_detections:
                 anchor = get_bottom_center(det["bbox"])
                 if point_in_polygon(anchor, polygon_np):
                     inside_count += 1
+                    if (
+                        use_touch_lpr
+                        and det.get("track_id") is not None
+                        and det.get("track_id") not in lpr_completed_track_ids
+                    ):
+                        crop = crop_bbox_from_frame(frame, det["bbox"])
+                        if crop is not None:
+                            track_id = det["track_id"]
+                            area = bbox_area(det["bbox"])
+                            current = vehicle_candidates.get(track_id)
+                            if current is None or area > current["area"]:
+                                vehicle_candidates[track_id] = {
+                                    "area": area,
+                                    "frame": crop,
+                                    "bbox": det["bbox"],
+                                    "frame_idx": frame_idx,
+                                    "time_sec": frame_idx / fps,
+                                }
 
             cached_inside_present = (inside_count > 0)
 
         detections = cached_detections
         inside_present = cached_inside_present
         current_time_sec = frame_idx / fps
+
+        if should_detect and use_touch_lpr:
+            if touch_mask is None:
+                touch_mask = make_polygon_mask(frame.shape, touch_polygon)
+            for det in detections:
+                track_id = det.get("track_id")
+                if track_id is None or track_id in lpr_completed_track_ids:
+                    continue
+                if det["class_name"] not in {"car", "motorcycle", "bus", "truck"}:
+                    continue
+                if not bbox_intersects_mask(det["bbox"], touch_mask):
+                    continue
+
+                candidate = vehicle_candidates.get(track_id)
+                candidate_frame = candidate["frame"] if candidate is not None else crop_bbox_from_frame(frame, det["bbox"])
+                if candidate_frame is None:
+                    lpr_completed_track_ids.add(track_id)
+                    continue
+
+                plate_recognitions = lpr_pipeline.recognize(candidate_frame, vehicle_detections=[det])
+                lpr_completed_track_ids.add(track_id)
+                vehicle_candidates.pop(track_id, None)
+
+                shot_path = ""
+                ok_save = False
+                if export_screenshots:
+                    ok_save, shot_path = try_save_screenshot(
+                        logs=logs,
+                        screenshot_out_dir=screenshot_out_dir,
+                        base_name=base_name,
+                        rel_video_path=rel_video_path,
+                        frame_idx=frame_idx,
+                        current_time_sec=current_time_sec,
+                        frame=frame,
+                        detections=detections,
+                        polygon=polygon,
+                        polygon_np=polygon_np,
+                        draw_roi_on_screenshot=draw_roi_on_screenshot,
+                        lpr_pipeline=None,
+                        touch_polygon=touch_polygon,
+                        record_type="lpr_touch",
+                        plate_recognitions_override=plate_recognitions,
+                    )
+                    if ok_save:
+                        grabbed_count += 1
+                else:
+                    logs.append({
+                        "type": "lpr_touch",
+                        "video_rel_path": rel_video_path,
+                        "event_time_sec": f"{current_time_sec:.2f}",
+                        "interval_start_sec": "",
+                        "interval_end_sec": "",
+                        "output_path": "",
+                        "status": "OK",
+                        "plate_text": ";".join(item.text for item in plate_recognitions if item.text),
+                        "plate_raw_text": ";".join(item.raw_text for item in plate_recognitions if item.raw_text),
+                        "plate_confidence": ";".join(f"{item.confidence:.3f}" for item in plate_recognitions),
+                        "plate_bbox": ";".join(",".join(str(v) for v in item.bbox) for item in plate_recognitions),
+                        "plate_valid_taiwan_format": ";".join("Y" if item.valid_taiwan_format else "N" for item in plate_recognitions),
+                        "plate_ocr_engine": lpr_pipeline.engine_name,
+                    })
+
+                if status_cb:
+                    plate_text = ";".join(item.text for item in plate_recognitions if item.text) or "未辨識"
+                    if export_screenshots and ok_save:
+                        status_cb(f"[LPR] track #{track_id} 觸碰區觸發：{plate_text} | {os.path.basename(shot_path)}")
+                    else:
+                        status_cb(f"[LPR] track #{track_id} 觸碰區觸發：{plate_text}")
 
         # ---------------------------------
         # 只有在真正偵測幀，才更新事件狀態
@@ -974,7 +1223,8 @@ def process_video(
                             polygon=polygon,
                             polygon_np=polygon_np,
                             draw_roi_on_screenshot=draw_roi_on_screenshot,
-                            lpr_pipeline=lpr_pipeline,
+                            lpr_pipeline=None if use_touch_lpr else lpr_pipeline,
+                            touch_polygon=touch_polygon if use_touch_lpr else None,
                         )
                         if ok_save:
                             grabbed_count += 1
@@ -984,10 +1234,13 @@ def process_video(
                             else:
                                 status_cb(f"[SHOT-FAIL] 截圖寫入失敗：{shot_path}")
 
-                    next_long_stay_shot_frame = frame_idx + max(
-                        1,
-                        int(round(LONG_STAY_SCREENSHOT_INTERVAL_SEC * fps))
-                    )
+                    if export_long_stay_screenshots:
+                        next_long_stay_shot_frame = frame_idx + max(
+                            1,
+                            int(round(LONG_STAY_SCREENSHOT_INTERVAL_SEC * fps))
+                        )
+                    else:
+                        next_long_stay_shot_frame = None
 
             else:
                 if inside_present:
@@ -996,6 +1249,7 @@ def process_video(
 
                     if (
                         export_screenshots
+                        and export_long_stay_screenshots
                         and next_long_stay_shot_frame is not None
                         and frame_idx >= next_long_stay_shot_frame
                     ):
@@ -1011,7 +1265,8 @@ def process_video(
                             polygon=polygon,
                             polygon_np=polygon_np,
                             draw_roi_on_screenshot=draw_roi_on_screenshot,
-                            lpr_pipeline=lpr_pipeline,
+                            lpr_pipeline=None if use_touch_lpr else lpr_pipeline,
+                            touch_polygon=touch_polygon if use_touch_lpr else None,
                         )
                         if ok_save:
                             grabbed_count += 1
