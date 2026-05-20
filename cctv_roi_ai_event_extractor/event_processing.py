@@ -654,6 +654,10 @@ def crop_bbox_from_frame(frame, bbox):
     return frame[y1:y2, x1:x2].copy()
 
 
+def is_vehicle_detection(det):
+    return det.get("class_name") in {"car", "motorcycle", "bus", "truck"}
+
+
 def make_polygon_mask(frame_shape, polygon):
     h, w = frame_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -1014,8 +1018,9 @@ def process_video(
 
     event_intervals = []
     polygon_np = np.array(polygon, dtype=np.int32)
+    detection_mask = None
     touch_mask = None
-    use_touch_lpr = lpr_pipeline is not None and touch_polygon is not None and len(touch_polygon) >= 3
+    use_touch_lpr = False
 
     in_event = False
     event_start_frame = None
@@ -1024,10 +1029,12 @@ def process_video(
 
     cached_detections = []
     cached_inside_present = False
+    cached_inside_vehicle_detections = []
     next_long_stay_shot_frame = None
     tracker = SimpleIouTracker(max_missed=max(4, start_trigger_frames * 2)) if use_touch_lpr else None
     vehicle_candidates = {}
     lpr_completed_track_ids = set()
+    use_detection_roi_lpr = lpr_pipeline is not None
 
     while True:
         if stop_checker and stop_checker():
@@ -1063,6 +1070,8 @@ def process_video(
 
         if should_detect:
             raw_detections = detector.detect(frame)
+            if use_detection_roi_lpr and detection_mask is None:
+                detection_mask = make_polygon_mask(frame.shape, polygon)
             if use_touch_lpr:
                 vehicle_detections = [
                     det for det in raw_detections
@@ -1082,7 +1091,14 @@ def process_video(
                 cached_detections = raw_detections
 
             inside_count = 0
+            cached_inside_vehicle_detections = []
             for det in cached_detections:
+                if (
+                    use_detection_roi_lpr
+                    and is_vehicle_detection(det)
+                    and bbox_intersects_mask(det["bbox"], detection_mask)
+                ):
+                    cached_inside_vehicle_detections.append(det)
                 anchor = get_bottom_center(det["bbox"])
                 if point_in_polygon(anchor, polygon_np):
                     inside_count += 1
@@ -1110,6 +1126,55 @@ def process_video(
         detections = cached_detections
         inside_present = cached_inside_present
         current_time_sec = frame_idx / fps
+
+        if should_detect and use_detection_roi_lpr and cached_inside_vehicle_detections:
+            plate_recognitions = lpr_pipeline.recognize(frame, vehicle_detections=cached_inside_vehicle_detections)
+            if plate_recognitions:
+                shot_path = ""
+                ok_save = False
+                if export_screenshots:
+                    ok_save, shot_path = try_save_screenshot(
+                        logs=logs,
+                        screenshot_out_dir=screenshot_out_dir,
+                        base_name=base_name,
+                        rel_video_path=rel_video_path,
+                        frame_idx=frame_idx,
+                        current_time_sec=current_time_sec,
+                        frame=frame,
+                        detections=detections,
+                        polygon=polygon,
+                        polygon_np=polygon_np,
+                        draw_roi_on_screenshot=draw_roi_on_screenshot,
+                        lpr_pipeline=None,
+                        touch_polygon=touch_polygon,
+                        record_type="lpr_detection",
+                        plate_recognitions_override=plate_recognitions,
+                    )
+                    if ok_save:
+                        grabbed_count += 1
+                else:
+                    logs.append({
+                        "type": "lpr_detection",
+                        "video_rel_path": rel_video_path,
+                        "event_time_sec": f"{current_time_sec:.2f}",
+                        "interval_start_sec": "",
+                        "interval_end_sec": "",
+                        "output_path": "",
+                        "status": "OK",
+                        "plate_text": ";".join(item.text for item in plate_recognitions if item.text),
+                        "plate_raw_text": ";".join(item.raw_text for item in plate_recognitions if item.raw_text),
+                        "plate_confidence": ";".join(f"{item.confidence:.3f}" for item in plate_recognitions),
+                        "plate_bbox": ";".join(",".join(str(v) for v in item.bbox) for item in plate_recognitions),
+                        "plate_valid_taiwan_format": ";".join("Y" if item.valid_taiwan_format else "N" for item in plate_recognitions),
+                        "plate_ocr_engine": lpr_pipeline.engine_name,
+                    })
+
+                if status_cb:
+                    plate_text = ";".join(item.text for item in plate_recognitions if item.text) or "未辨識"
+                    if export_screenshots and ok_save:
+                        status_cb(f"[LPR] 偵測區車輛辨識：{plate_text} | {os.path.basename(shot_path)}")
+                    else:
+                        status_cb(f"[LPR] 偵測區車輛辨識：{plate_text}")
 
         if should_detect and use_touch_lpr:
             if touch_mask is None:
@@ -1223,7 +1288,7 @@ def process_video(
                             polygon=polygon,
                             polygon_np=polygon_np,
                             draw_roi_on_screenshot=draw_roi_on_screenshot,
-                            lpr_pipeline=None if use_touch_lpr else lpr_pipeline,
+                            lpr_pipeline=None if use_detection_roi_lpr else lpr_pipeline,
                             touch_polygon=touch_polygon if use_touch_lpr else None,
                         )
                         if ok_save:
@@ -1265,7 +1330,7 @@ def process_video(
                             polygon=polygon,
                             polygon_np=polygon_np,
                             draw_roi_on_screenshot=draw_roi_on_screenshot,
-                            lpr_pipeline=None if use_touch_lpr else lpr_pipeline,
+                            lpr_pipeline=None if use_detection_roi_lpr else lpr_pipeline,
                             touch_polygon=touch_polygon if use_touch_lpr else None,
                         )
                         if ok_save:

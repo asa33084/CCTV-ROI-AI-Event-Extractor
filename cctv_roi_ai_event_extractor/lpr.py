@@ -100,6 +100,14 @@ def is_valid_taiwan_plate(text: str) -> bool:
 
 
 def crop_bbox(frame, bbox, padding_ratio: float = 0.06):
+    result = crop_bbox_with_offset(frame, bbox, padding_ratio=padding_ratio)
+    if result is None:
+        return None
+    crop, _offset_x, _offset_y = result
+    return crop
+
+
+def crop_bbox_with_offset(frame, bbox, padding_ratio: float = 0.06):
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = bbox
     bw = max(1, x2 - x1)
@@ -112,7 +120,7 @@ def crop_bbox(frame, bbox, padding_ratio: float = 0.06):
     y2 = min(h, y2 + pad_y)
     if x2 <= x1 or y2 <= y1:
         return None
-    return frame[y1:y2, x1:x2].copy()
+    return frame[y1:y2, x1:x2].copy(), x1, y1
 
 
 def rectify_plate_crop(plate_bgr):
@@ -472,9 +480,30 @@ class LicensePlateRecognizer:
         return self.ocr.name
 
     def recognize(self, frame, vehicle_detections=None) -> list[PlateRecognition]:
-        plates = self.detector.detect(frame)
         recognitions = []
-        for plate in plates:
+        vehicle_bboxes = []
+        for det in vehicle_detections or []:
+            bbox = det.get("bbox") if isinstance(det, dict) else None
+            if bbox is not None and bbox not in vehicle_bboxes:
+                vehicle_bboxes.append(bbox)
+
+        if vehicle_bboxes:
+            plate_sources = []
+            for vehicle_bbox in vehicle_bboxes:
+                crop_result = crop_bbox_with_offset(frame, vehicle_bbox, padding_ratio=0.02)
+                if crop_result is None:
+                    continue
+                vehicle_crop, offset_x, offset_y = crop_result
+                for plate in self.detector.detect(vehicle_crop):
+                    x1, y1, x2, y2 = plate.bbox
+                    plate_sources.append(PlateCandidate(
+                        bbox=(x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y),
+                        score=plate.score,
+                    ))
+        else:
+            plate_sources = self.detector.detect(frame)
+
+        for plate in plate_sources:
             crop = crop_bbox(frame, plate.bbox)
             if crop is None:
                 continue

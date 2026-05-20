@@ -5,10 +5,10 @@
 ## 功能重點
 
 - 支援單一資料夾、多資料夾、單一影片、多影片批次處理
-- 以 Polygon ROI 框選偵測區與車牌辨識觸碰區
+- 以 Polygon ROI 框選偵測區，觸碰區可選擇性保留作為截圖標示
 - 偵測 `person`、`car`、`motorcycle`、`bus`、`truck`
 - 只有當目標底部中心點進入偵測區並連續達到門檻幀數時，才判定事件開始
-- 啟用車牌辨識時，車輛 bbox 碰到觸碰區後，才會使用偵測區內暫存的較佳候選影像做 LPR
+- 啟用車牌辨識時，會辨識偵測區內的所有車輛，不依賴觸碰區或連續追蹤
 - 可輸出事件截圖、事件片段、CSV 日誌與文字摘要報表
 - 長時間停留補抓截圖可在 GUI 中獨立開關
 - 可輸出蒐證 Excel，欄位為 `編號`、`進入日期`、`出去日期`、`車號`、`車輛截圖`
@@ -246,7 +246,7 @@ python cctv_roi_ai_event_extractor_qt.py
 1. 啟動程式
 2. 選擇影片來源
 3. 選擇輸出資料夾
-4. 以第一支可讀影片依序框選偵測區 Polygon ROI 與觸碰區 Polygon ROI
+4. 以第一支可讀影片框選偵測區 Polygon ROI，視需要保留或調整觸碰區 Polygon ROI
 5. 輸入 AI 參數
 6. 開始批次分析
 
@@ -277,7 +277,7 @@ output_root/
 plate_text, plate_raw_text, plate_confidence, plate_bbox, plate_valid_taiwan_format, plate_ocr_engine
 ```
 
-另外 ROI 設定會儲存在程式同層。新版設定包含 `detection_polygon` 與 `touch_polygon`，仍相容舊版 `polygon`：
+另外 ROI 設定會儲存在程式同層。新版設定包含 `detection_polygon`，可選擇保留 `touch_polygon`，仍相容舊版 `polygon`：
 
 ```text
 roi_config_polygon.json

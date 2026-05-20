@@ -774,7 +774,7 @@ class MainWindow(QMainWindow):
         help_text.setPlainText(
             "來源選擇：可設為單一資料夾、累加多個資料夾、設為單一影片，或一次設為多個影片；也可在清單中多選後移除。\n"
             "Polygon ROI 操作：左鍵加點、右鍵刪點、清空、確認。\n"
-            "邏輯說明：偵測區控制事件起訖；啟用車牌辨識時，車輛 bbox 碰到觸碰區後，才會使用偵測區內暫存的最佳候選影像做 LPR。\n"
+            "邏輯說明：偵測區控制事件起訖；啟用車牌辨識時，會對偵測區內的所有車輛執行 LPR，不依賴觸碰區或連續追蹤。\n"
             "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段仍輸出原始影片。"
             "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可在 PaddleOCR 或 SVTR / ONNX 二選一。"
         )
@@ -1186,27 +1186,35 @@ class MainWindow(QMainWindow):
         bx, by, bw, bh = polygon_bbox(self.polygon)
         self.lbl_roi.setText(f"偵測區 Polygon ROI：{len(self.polygon)} 點 | 外接框 X={bx} Y={by} W={bw} H={bh}")
 
-        self.set_status(f"觸碰區 Polygon ROI 框選中：{safe_relpath(readable_video, self.input_dir)}")
-        try:
-            touch_picker = PolygonRoiDialog(
-                readable_video,
-                preset_polygon=preset_touch_polygon,
-                parent=self,
-                title="觸碰區 Polygon ROI 選取",
-                description="請框選較後方的觸碰區。車輛 track 的 bbox 碰到此區後，才會用偵測區內暫存的最佳候選影像做車牌辨識。",
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "ROI 預覽失敗", str(e))
-            self.set_status("待命")
-            return
+        self.touch_polygon = preset_touch_polygon
+        touch_result = QMessageBox.question(
+            self,
+            "觸碰區 ROI",
+            "目前 OCR 會辨識偵測區內的所有車輛，不再依賴觸碰區。\n\n是否仍要設定觸碰區作為截圖標示或後續分析保留？",
+        )
+        if touch_result == QMessageBox.StandardButton.Yes:
+            self.set_status(f"觸碰區 Polygon ROI 框選中：{safe_relpath(readable_video, self.input_dir)}")
+            try:
+                touch_picker = PolygonRoiDialog(
+                    readable_video,
+                    preset_polygon=preset_touch_polygon,
+                    parent=self,
+                    title="觸碰區 Polygon ROI 選取",
+                    description="觸碰區目前僅作為截圖標示或後續分析保留；OCR 會辨識偵測區內的所有車輛。",
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "ROI 預覽失敗", str(e))
+                self.set_status("待命")
+                return
 
-        if touch_picker.exec() != QDialog.DialogCode.Accepted or not touch_picker.result_polygon:
-            self.set_status("待命")
-            return
+            if touch_picker.exec() == QDialog.DialogCode.Accepted and touch_picker.result_polygon:
+                self.touch_polygon = touch_picker.result_polygon
 
-        self.touch_polygon = touch_picker.result_polygon
-        tbx, tby, tbw, tbh = polygon_bbox(self.touch_polygon)
-        self.lbl_touch_roi.setText(f"觸碰區 Polygon ROI：{len(self.touch_polygon)} 點 | 外接框 X={tbx} Y={tby} W={tbw} H={tbh}")
+        if self.touch_polygon:
+            tbx, tby, tbw, tbh = polygon_bbox(self.touch_polygon)
+            self.lbl_touch_roi.setText(f"觸碰區 Polygon ROI：{len(self.touch_polygon)} 點 | 外接框 X={tbx} Y={tby} W={tbw} H={tbh}")
+        else:
+            self.lbl_touch_roi.setText("觸碰區 Polygon ROI：未設定（OCR 不依賴觸碰區）")
         save_roi_regions(self.app_dir, self.polygon, self.touch_polygon)
 
         params = self.ask_all_params()
