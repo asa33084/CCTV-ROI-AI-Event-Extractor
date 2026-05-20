@@ -1129,7 +1129,8 @@ def process_video(
 
         if should_detect and use_detection_roi_lpr and cached_inside_vehicle_detections:
             plate_recognitions = lpr_pipeline.recognize(frame, vehicle_detections=cached_inside_vehicle_detections)
-            if plate_recognitions:
+            recognized_plate_recognitions = [item for item in plate_recognitions if item.text]
+            if recognized_plate_recognitions:
                 shot_path = ""
                 ok_save = False
                 if export_screenshots:
@@ -1148,7 +1149,7 @@ def process_video(
                         lpr_pipeline=None,
                         touch_polygon=touch_polygon,
                         record_type="lpr_detection",
-                        plate_recognitions_override=plate_recognitions,
+                        plate_recognitions_override=recognized_plate_recognitions,
                     )
                     if ok_save:
                         grabbed_count += 1
@@ -1161,16 +1162,16 @@ def process_video(
                         "interval_end_sec": "",
                         "output_path": "",
                         "status": "OK",
-                        "plate_text": ";".join(item.text for item in plate_recognitions if item.text),
-                        "plate_raw_text": ";".join(item.raw_text for item in plate_recognitions if item.raw_text),
-                        "plate_confidence": ";".join(f"{item.confidence:.3f}" for item in plate_recognitions),
-                        "plate_bbox": ";".join(",".join(str(v) for v in item.bbox) for item in plate_recognitions),
-                        "plate_valid_taiwan_format": ";".join("Y" if item.valid_taiwan_format else "N" for item in plate_recognitions),
+                        "plate_text": ";".join(item.text for item in recognized_plate_recognitions),
+                        "plate_raw_text": ";".join(item.raw_text for item in recognized_plate_recognitions if item.raw_text),
+                        "plate_confidence": ";".join(f"{item.confidence:.3f}" for item in recognized_plate_recognitions),
+                        "plate_bbox": ";".join(",".join(str(v) for v in item.bbox) for item in recognized_plate_recognitions),
+                        "plate_valid_taiwan_format": ";".join("Y" if item.valid_taiwan_format else "N" for item in recognized_plate_recognitions),
                         "plate_ocr_engine": lpr_pipeline.engine_name,
                     })
 
                 if status_cb:
-                    plate_text = ";".join(item.text for item in plate_recognitions if item.text) or "未辨識"
+                    plate_text = ";".join(item.text for item in recognized_plate_recognitions)
                     if export_screenshots and ok_save:
                         status_cb(f"[LPR] 偵測區車輛辨識：{plate_text} | {os.path.basename(shot_path)}")
                     else:
