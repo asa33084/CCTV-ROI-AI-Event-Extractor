@@ -1058,7 +1058,7 @@ def process_video(
 
         frame_idx += 1
 
-        if progress_cb and total > 0 and frame_idx % 10 == 0:
+        if progress_cb and frame_idx % 10 == 0:
             progress_cb(frame_idx, total)
 
         # 關鍵原則：
@@ -1419,8 +1419,8 @@ def process_video(
                     "status": "OK"
                 })
 
-    if progress_cb and total > 0:
-        progress_cb(total, total)
+    if progress_cb:
+        progress_cb(total if total > 0 else frame_idx, total)
 
     if status_cb:
         status_cb(f"[DONE] {rel_video_path} 擷取 {grabbed_count} 張，輸出 {clip_count} 支事件片段")
@@ -1793,7 +1793,10 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
                     self.pbar["value"] = done
                     self.lbl_progress.config(text=f"進度：{done}/{total}")
                 elif action == "frame_progress":
-                    self.lbl_frame_progress.config(text=f"目前影片進度：{kwargs['current']}/{kwargs['total']}")
+                    if int(kwargs["total"]) > 0:
+                        self.lbl_frame_progress.config(text=f"目前影片進度：{kwargs['current']}/{kwargs['total']}")
+                    else:
+                        self.lbl_frame_progress.config(text=f"目前影片進度：已處理 {kwargs['current']} 幀（總幀數未知）")
                 elif action == "message_info":
                     messagebox.showinfo(kwargs["title"], kwargs["message"], parent=self)
                 elif action == "message_error":

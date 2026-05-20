@@ -1312,7 +1312,10 @@ class MainWindow(QMainWindow):
         self.lbl_progress.setText(f"進度：{done}/{total}")
 
     def on_worker_frame_progress(self, current, total):
-        self.lbl_frame_progress.setText(f"目前影片進度：{current}/{total}")
+        if int(total) > 0:
+            self.lbl_frame_progress.setText(f"目前影片進度：{current}/{total}")
+        else:
+            self.lbl_frame_progress.setText(f"目前影片進度：已處理 {current} 幀（總幀數未知）")
 
     def on_worker_failed(self, title, message):
         self.set_controls_enabled(True)
