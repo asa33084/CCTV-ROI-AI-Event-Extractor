@@ -71,6 +71,8 @@ except Exception:
 
 
 LONG_STAY_SCREENSHOT_INTERVAL_SEC = load_config().long_stay_screenshot_interval_sec
+LPR_AGGREGATION_WINDOW_SEC = 1.5
+LPR_DUPLICATE_SUPPRESS_SEC = 8.0
 
 
 # ---------------------------
@@ -658,6 +660,42 @@ def is_vehicle_detection(det):
     return det.get("class_name") in {"car", "motorcycle", "bus", "truck"}
 
 
+def plate_text_distance(a, b):
+    a = a or ""
+    b = b or ""
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > 1:
+        return 2
+    if len(a) == len(b):
+        return sum(1 for left, right in zip(a, b) if left != right)
+
+    if len(a) > len(b):
+        a, b = b, a
+    i = 0
+    j = 0
+    edits = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return edits
+        j += 1
+    return edits + (len(b) - j)
+
+
+def plate_texts_similar(a, b):
+    return bool(a and b and plate_text_distance(a, b) <= 1)
+
+
+def plate_recognition_quality(item):
+    valid_bonus = 1.0 if item.valid_taiwan_format else 0.0
+    return valid_bonus + float(item.confidence or 0.0) + (float(item.detector_score or 0.0) * 0.1)
+
+
 def make_polygon_mask(frame_shape, polygon):
     h, w = frame_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -1035,6 +1073,109 @@ def process_video(
     vehicle_candidates = {}
     lpr_completed_track_ids = set()
     use_detection_roi_lpr = lpr_pipeline is not None
+    lpr_pending_groups = []
+    lpr_suppressed_until = {}
+
+    def flush_lpr_group(group):
+        nonlocal grabbed_count
+        record = group["record"]
+        recognition = group["recognition"]
+        shot_path = ""
+        ok_save = False
+        if export_screenshots:
+            ok_save, shot_path = try_save_screenshot(
+                logs=logs,
+                screenshot_out_dir=screenshot_out_dir,
+                base_name=base_name,
+                rel_video_path=rel_video_path,
+                frame_idx=record["frame_idx"],
+                current_time_sec=record["time_sec"],
+                frame=record["frame"],
+                detections=record["detections"],
+                polygon=polygon,
+                polygon_np=polygon_np,
+                draw_roi_on_screenshot=draw_roi_on_screenshot,
+                lpr_pipeline=None,
+                touch_polygon=touch_polygon,
+                record_type="lpr_detection",
+                plate_recognitions_override=[recognition],
+            )
+            if ok_save:
+                grabbed_count += 1
+        else:
+            logs.append({
+                "type": "lpr_detection",
+                "video_rel_path": rel_video_path,
+                "event_time_sec": f'{record["time_sec"]:.2f}',
+                "interval_start_sec": "",
+                "interval_end_sec": "",
+                "output_path": "",
+                "status": "OK",
+                "plate_text": recognition.text,
+                "plate_raw_text": recognition.raw_text,
+                "plate_confidence": f"{recognition.confidence:.3f}",
+                "plate_bbox": ",".join(str(v) for v in recognition.bbox),
+                "plate_valid_taiwan_format": "Y" if recognition.valid_taiwan_format else "N",
+                "plate_ocr_engine": lpr_pipeline.engine_name,
+            })
+
+        lpr_suppressed_until[recognition.text] = record["time_sec"] + LPR_DUPLICATE_SUPPRESS_SEC
+        if status_cb:
+            if export_screenshots and ok_save:
+                status_cb(f"[LPR] 偵測區車輛辨識：{recognition.text} | {os.path.basename(shot_path)}")
+            else:
+                status_cb(f"[LPR] 偵測區車輛辨識：{recognition.text}")
+
+    def flush_due_lpr_groups(now_sec, force=False):
+        remaining = []
+        for group in lpr_pending_groups:
+            if force or (now_sec - group["first_seen_sec"]) >= LPR_AGGREGATION_WINDOW_SEC:
+                flush_lpr_group(group)
+            else:
+                remaining.append(group)
+        lpr_pending_groups[:] = remaining
+
+    def is_lpr_text_suppressed(text, time_sec):
+        for suppressed_text, suppress_until in lpr_suppressed_until.items():
+            if suppress_until > time_sec and plate_texts_similar(text, suppressed_text):
+                return True
+        return False
+
+    def queue_lpr_recognitions(recognitions, frame, detections, frame_idx_value, time_sec):
+        for recognition in recognitions:
+            if not recognition.text:
+                continue
+            if is_lpr_text_suppressed(recognition.text, time_sec):
+                continue
+
+            matching_group = None
+            for group in lpr_pending_groups:
+                if plate_texts_similar(recognition.text, group["recognition"].text):
+                    matching_group = group
+                    break
+
+            record = {
+                "frame": frame.copy(),
+                "detections": [dict(det) for det in detections],
+                "frame_idx": frame_idx_value,
+                "time_sec": time_sec,
+            }
+            quality = plate_recognition_quality(recognition)
+            if matching_group is None:
+                lpr_pending_groups.append({
+                    "first_seen_sec": time_sec,
+                    "last_seen_sec": time_sec,
+                    "recognition": recognition,
+                    "quality": quality,
+                    "record": record,
+                })
+                continue
+
+            matching_group["last_seen_sec"] = time_sec
+            if quality > matching_group["quality"]:
+                matching_group["recognition"] = recognition
+                matching_group["quality"] = quality
+                matching_group["record"] = record
 
     while True:
         if stop_checker and stop_checker():
@@ -1131,51 +1272,15 @@ def process_video(
             plate_recognitions = lpr_pipeline.recognize(frame, vehicle_detections=cached_inside_vehicle_detections)
             recognized_plate_recognitions = [item for item in plate_recognitions if item.text]
             if recognized_plate_recognitions:
-                shot_path = ""
-                ok_save = False
-                if export_screenshots:
-                    ok_save, shot_path = try_save_screenshot(
-                        logs=logs,
-                        screenshot_out_dir=screenshot_out_dir,
-                        base_name=base_name,
-                        rel_video_path=rel_video_path,
-                        frame_idx=frame_idx,
-                        current_time_sec=current_time_sec,
-                        frame=frame,
-                        detections=detections,
-                        polygon=polygon,
-                        polygon_np=polygon_np,
-                        draw_roi_on_screenshot=draw_roi_on_screenshot,
-                        lpr_pipeline=None,
-                        touch_polygon=touch_polygon,
-                        record_type="lpr_detection",
-                        plate_recognitions_override=recognized_plate_recognitions,
-                    )
-                    if ok_save:
-                        grabbed_count += 1
-                else:
-                    logs.append({
-                        "type": "lpr_detection",
-                        "video_rel_path": rel_video_path,
-                        "event_time_sec": f"{current_time_sec:.2f}",
-                        "interval_start_sec": "",
-                        "interval_end_sec": "",
-                        "output_path": "",
-                        "status": "OK",
-                        "plate_text": ";".join(item.text for item in recognized_plate_recognitions),
-                        "plate_raw_text": ";".join(item.raw_text for item in recognized_plate_recognitions if item.raw_text),
-                        "plate_confidence": ";".join(f"{item.confidence:.3f}" for item in recognized_plate_recognitions),
-                        "plate_bbox": ";".join(",".join(str(v) for v in item.bbox) for item in recognized_plate_recognitions),
-                        "plate_valid_taiwan_format": ";".join("Y" if item.valid_taiwan_format else "N" for item in recognized_plate_recognitions),
-                        "plate_ocr_engine": lpr_pipeline.engine_name,
-                    })
-
-                if status_cb:
-                    plate_text = ";".join(item.text for item in recognized_plate_recognitions)
-                    if export_screenshots and ok_save:
-                        status_cb(f"[LPR] 偵測區車輛辨識：{plate_text} | {os.path.basename(shot_path)}")
-                    else:
-                        status_cb(f"[LPR] 偵測區車輛辨識：{plate_text}")
+                queue_lpr_recognitions(
+                    recognized_plate_recognitions,
+                    frame=frame,
+                    detections=detections,
+                    frame_idx_value=frame_idx,
+                    time_sec=current_time_sec,
+                )
+        if use_detection_roi_lpr:
+            flush_due_lpr_groups(current_time_sec)
 
         if should_detect and use_touch_lpr:
             if touch_mask is None:
@@ -1377,6 +1482,9 @@ def process_video(
         start_t = max(0.0, (event_start_frame - 1) / fps)
         end_t = max(start_t, event_end_frame / fps)
         event_intervals.append((start_t, end_t))
+
+    if use_detection_roi_lpr:
+        flush_due_lpr_groups(frame_idx / fps if frame_idx > 0 else 0.0, force=True)
 
     cap.release()
 
