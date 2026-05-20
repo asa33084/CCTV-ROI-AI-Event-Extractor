@@ -55,16 +55,20 @@ def _first_existing_path(paths):
 def build_evidence_rows(csv_rows):
     rows = []
     for item in csv_rows:
-        if item.get("record_type") != "screenshot":
+        record_type = item.get("record_type")
+        if record_type not in {"screenshot", "lpr_detection"}:
+            continue
+        plate_text = item.get("plate_text", "")
+        if record_type == "screenshot" and not plate_text:
             continue
         screenshot_path = _first_existing_path([item.get("output_path")])
-        if not screenshot_path:
+        if record_type == "screenshot" and not screenshot_path:
             continue
         rows.append({
             "entry_datetime": format_event_datetime(item.get("video_rel_path", ""), item.get("event_time_sec", "")),
             "exit_datetime": format_event_datetime(item.get("video_rel_path", ""), item.get("interval_end_sec", "")),
-            "plate_text": item.get("plate_text", ""),
-            "screenshot_path": screenshot_path,
+            "plate_text": plate_text,
+            "screenshot_path": screenshot_path or "",
         })
     return rows
 
@@ -103,6 +107,8 @@ def write_evidence_workbook(output_path: str, csv_rows):
         for col_idx in range(1, 5):
             ws.cell(row=row_idx, column=col_idx).alignment = Alignment(horizontal="center", vertical="center")
 
+        if not item["screenshot_path"]:
+            continue
         try:
             img = ExcelImage(item["screenshot_path"])
             img.width = 160

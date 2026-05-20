@@ -14,6 +14,8 @@ TAIWAN_PLATE_PATTERNS = (
     re.compile(r"^[0-9]{4}[A-Z]{2}$"),
     re.compile(r"^[A-Z]{2}[0-9]{3}$"),
 )
+PLATE_TEXT_MIN_LEN = 4
+PLATE_TEXT_MAX_LEN = 8
 
 STRIP_MAP = str.maketrans({
     " ": "",
@@ -65,13 +67,30 @@ def normalize_taiwan_plate_text(raw_text: str) -> str:
         return ""
 
     text = text.translate(STRIP_MAP)
-    candidates = [text]
-    candidates.extend(_taiwan_plate_position_candidates(text))
+    candidates = _plate_text_candidates(text)
 
     for candidate in candidates:
         if is_valid_taiwan_plate(candidate):
             return candidate
-    return candidates[-1] if candidates else text
+    return candidates[0] if candidates else ""
+
+
+def _plate_text_candidates(text: str) -> list[str]:
+    candidates = []
+
+    def add(value):
+        if PLATE_TEXT_MIN_LEN <= len(value) <= PLATE_TEXT_MAX_LEN and value not in candidates:
+            candidates.append(value)
+            for positioned in _taiwan_plate_position_candidates(value):
+                if positioned not in candidates:
+                    candidates.append(positioned)
+
+    add(text)
+    if len(text) > PLATE_TEXT_MAX_LEN:
+        for size in range(PLATE_TEXT_MAX_LEN, PLATE_TEXT_MIN_LEN - 1, -1):
+            for start in range(0, len(text) - size + 1):
+                add(text[start:start + size])
+    return candidates
 
 
 def _letters(value: str) -> str:

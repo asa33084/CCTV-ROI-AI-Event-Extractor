@@ -691,6 +691,12 @@ def plate_texts_similar(a, b):
     return bool(a and b and plate_text_distance(a, b) <= 1)
 
 
+def plate_recognitions_match(left, right):
+    if plate_texts_similar(left.text, right.text):
+        return True
+    return bbox_iou(left.bbox, right.bbox) >= 0.25
+
+
 def plate_recognition_quality(item):
     valid_bonus = 1.0 if item.valid_taiwan_format else 0.0
     return valid_bonus + float(item.confidence or 0.0) + (float(item.detector_score or 0.0) * 0.1)
@@ -1150,7 +1156,7 @@ def process_video(
 
             matching_group = None
             for group in lpr_pending_groups:
-                if plate_texts_similar(recognition.text, group["recognition"].text):
+                if plate_recognitions_match(recognition, group["recognition"]):
                     matching_group = group
                     break
 
