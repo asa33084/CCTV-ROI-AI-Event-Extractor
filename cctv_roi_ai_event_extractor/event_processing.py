@@ -72,12 +72,15 @@ except Exception:
 
 
 LONG_STAY_SCREENSHOT_INTERVAL_SEC = load_config().long_stay_screenshot_interval_sec
+# LPR uses short aggregation and suppression windows to avoid saving many screenshots
+# for the same plate while the vehicle remains in view.
 LPR_AGGREGATION_WINDOW_SEC = 20.0
 LPR_DUPLICATE_SUPPRESS_SEC = 20.0
 LPR_LOCATION_SUPPRESS_SEC = 60.0
 LPR_LOCATION_IOU_THRESHOLD = 0.10
 STREAM_TRACK_RESET_GAP_SEC = 2.0
-VEHICLE_TRACK_DUPLICATE_IOU_THRESHOLD = 0.70
+STREAM_TRACK_FINALIZE_MISSING_SEC = 2.0
+VEHICLE_TRACK_DUPLICATE_IOU_THRESHOLD = 0.35
 
 
 # ---------------------------
@@ -92,6 +95,7 @@ def ensure_dir(path: str):
 
 
 def get_auto_device_info() -> dict:
+    """Prefer NVIDIA CUDA when available, otherwise fall back to CPU."""
     info = {
         "device": "cpu",
         "name": "CPU",
@@ -125,6 +129,7 @@ def get_auto_device_info() -> dict:
 
 
 def list_available_compute_devices():
+    """Return UI-friendly compute device choices."""
     devices = [{
         "value": "cpu",
         "label": "CPU",
@@ -170,6 +175,7 @@ def describe_available_compute_devices():
 
 
 def resolve_default_model_path(app_dir: str) -> str:
+    """Resolve the YOLO model path from config or common app-local locations."""
     configured_model_path = load_config().model_path
     if configured_model_path:
         return os.path.abspath(configured_model_path)
@@ -220,6 +226,7 @@ def _download_model_from_url(url: str, target_path: str, status_cb=None):
 
 
 def ensure_model_available(model_path: str, status_cb=None):
+    """Ensure the detector model exists, trying configured URLs before Ultralytics assets."""
     model_path = os.path.abspath(model_path)
     if os.path.exists(model_path) and os.path.getsize(model_path) > 0:
         return True, model_path
@@ -300,6 +307,7 @@ def load_roi_config(app_dir: str):
 
 
 def _clean_polygon(polygon):
+    """Validate JSON-loaded polygon data and normalize points to integer tuples."""
     if not isinstance(polygon, list) or len(polygon) < 3:
         return None
 
@@ -404,6 +412,8 @@ def safe_get_int_prop(cap, prop_id) -> int:
 # Polygon ROI Picker
 # ---------------------------
 class PolygonROIPicker:
+    """OpenCV-based polygon picker used by the legacy Tk interface."""
+
     def __init__(self, video_path: str, preset_polygon=None, display_width=1400):
         self.video_path = video_path
         self.points = list(preset_polygon) if preset_polygon else []
@@ -554,6 +564,8 @@ def find_first_readable_video(video_paths):
 # AI Detector
 # ---------------------------
 class ObjectDetector:
+    """YOLO object detector/tracker wrapper for people and vehicle classes."""
+
     def __init__(self, model_path: str, conf: float = 0.4, detect_width: int = 1280, device: str | None = None):
         self.model = YOLO(model_path)
         self.conf = conf
@@ -568,6 +580,7 @@ class ObjectDetector:
         }
 
     def _prepare_detect_frame(self, frame):
+        """Resize large frames for inference and return factors for restoring boxes."""
         h, w = frame.shape[:2]
         if w <= self.detect_width:
             return frame, 1.0, 1.0
@@ -613,6 +626,7 @@ class ObjectDetector:
         return detections
 
     def reset_trackers(self):
+        """Reset Ultralytics tracker state between unrelated streams or large time gaps."""
         predictor = getattr(self.model, "predictor", None)
         trackers = getattr(predictor, "trackers", None) if predictor is not None else None
         for tracker in trackers or []:
@@ -673,6 +687,7 @@ class ObjectDetector:
 # ROI / 繪圖工具
 # ---------------------------
 def get_bottom_center(bbox):
+    """Use the bottom-center point as the ROI anchor for person/vehicle detections."""
     x1, y1, x2, y2 = bbox
     x_center = int((x1 + x2) / 2)
     y_bottom = int(y2)
@@ -722,6 +737,7 @@ def is_vehicle_detection(det):
 
 
 def suppress_duplicate_vehicle_tracks(detections, iou_threshold=VEHICLE_TRACK_DUPLICATE_IOU_THRESHOLD):
+    """Remove overlapping vehicle boxes, keeping the highest-confidence detection."""
     kept = []
     for det in sorted(detections, key=lambda item: float(item.get("score", 0.0)), reverse=True):
         if any(bbox_iou(det["bbox"], existing["bbox"]) >= iou_threshold for existing in kept):
@@ -731,6 +747,7 @@ def suppress_duplicate_vehicle_tracks(detections, iou_threshold=VEHICLE_TRACK_DU
 
 
 def plate_text_distance(a, b):
+    """Small edit-distance helper tuned for plate strings that may differ by one OCR error."""
     a = a or ""
     b = b or ""
     if a == b:
@@ -762,6 +779,7 @@ def plate_texts_similar(a, b):
 
 
 def plate_recognitions_match(left, right):
+    """Treat recognitions as the same sighting by plate text similarity or box overlap."""
     if plate_texts_similar(left.text, right.text):
         return True
     return bbox_iou(left.bbox, right.bbox) >= LPR_LOCATION_IOU_THRESHOLD
@@ -773,6 +791,7 @@ def plate_recognition_quality(item):
 
 
 def make_polygon_mask(frame_shape, polygon):
+    """Rasterize a polygon so bbox intersection can be checked cheaply."""
     h, w = frame_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     if polygon and len(polygon) >= 3:
@@ -796,6 +815,8 @@ def bbox_intersects_mask(bbox, mask):
 
 
 class SimpleIouTracker:
+    """Lightweight fallback tracker that links detections by class and IOU."""
+
     def __init__(self, iou_threshold=0.25, max_missed=8):
         self.iou_threshold = float(iou_threshold)
         self.max_missed = int(max_missed)
@@ -887,6 +908,7 @@ def polygon_bbox(polygon):
 
 
 def build_screenshot_frame(frame, detections, polygon, polygon_np, draw_roi_on_screenshot, plate_recognitions=None, touch_polygon=None):
+    """Create the annotated frame used for saved screenshots."""
     if not draw_roi_on_screenshot:
         annotated = frame.copy()
         return draw_plate_recognitions(annotated, plate_recognitions)
@@ -906,6 +928,7 @@ def build_screenshot_frame(frame, detections, polygon, polygon_np, draw_roi_on_s
 def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, frame_idx, current_time_sec,
                         frame, detections, polygon, polygon_np, draw_roi_on_screenshot, lpr_pipeline=None,
                         touch_polygon=None, record_type="screenshot", plate_recognitions_override=None):
+    """Save one screenshot and append the corresponding CSV/log row."""
     plate_recognitions = []
     if plate_recognitions_override is not None:
         plate_recognitions = plate_recognitions_override
@@ -960,6 +983,7 @@ def export_interval_clip(
     clip_index: int,
     status_cb=None
 ):
+    """Export a raw video segment for a detected event interval."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         if status_cb:
@@ -1050,13 +1074,16 @@ def _format_datetime(value):
 
 
 def _track_row_key(camera_id, tracker_session_id, track_id):
+    """Build a stable internal key for one tracker id within a camera/session."""
     return f"{camera_id}:{tracker_session_id}:{track_id}"
 
 
-def _format_track_id(tracker_session_id, track_id):
-    if tracker_session_id <= 1:
-        return str(track_id)
-    return f"{tracker_session_id}-{track_id}"
+def _format_track_id(tracker_session_id, track_id, lifecycle_index=1):
+    """Format user-facing track ids, including tracker resets and reused ids."""
+    base = str(track_id) if tracker_session_id <= 1 else f"{tracker_session_id}-{track_id}"
+    if lifecycle_index <= 1:
+        return base
+    return f"{base}.{lifecycle_index}"
 
 
 def _segment_gap_sec(previous_segment, current_segment):
@@ -1067,6 +1094,11 @@ def _segment_gap_sec(previous_segment, current_segment):
     ):
         return None
     return (current_segment.start_datetime - previous_segment.end_datetime).total_seconds()
+
+
+def _stream_track_max_missing_frames(segment):
+    fps = float(getattr(segment, "fps", 0.0) or 0.0) or 30.0
+    return max(1, int(round(fps * STREAM_TRACK_FINALIZE_MISSING_SEC)))
 
 
 def _empty_log_row(record_type, video_rel_path="", status="OK"):
@@ -1115,6 +1147,7 @@ def process_video_stream(
     status_cb=None,
     stop_checker=None,
 ):
+    """Process multiple video files as per-camera streams and summarize each tracked vehicle."""
     del start_trigger_frames, end_hold_sec, pre_event_sec, post_event_sec
     del touch_polygon, export_long_stay_screenshots
 
@@ -1142,7 +1175,10 @@ def process_video_stream(
     for camera_id, segments in stream.iter_camera_segments():
         detector.reset_trackers()
         records = {}
+        completed_records = []
         missing_counts = {}
+        active_key_by_raw_key = {}
+        lifecycle_counts = {}
         first_track_frame = True
         current_segment = None
         tracker_session_id = 1
@@ -1170,6 +1206,7 @@ def process_video_stream(
                 }
 
             if stream_item.segment != current_segment:
+                # Keep tracker identity across adjacent files, but reset after unknown or large gaps.
                 gap_sec = _segment_gap_sec(current_segment, stream_item.segment)
                 should_reset = current_segment is not None and (
                     gap_sec is None or gap_sec > STREAM_TRACK_RESET_GAP_SEC
@@ -1192,12 +1229,10 @@ def process_video_stream(
             if progress_cb and processed_frames % 10 == 0:
                 progress_cb(processed_frames, total_frames)
 
-            if (stream_item.stream_frame_idx - 1) % detect_every_n_frames != 0:
-                continue
-
             detections = detector.track(stream_item.frame, persist=not first_track_frame)
             first_track_frame = False
             detection_mask = make_polygon_mask(stream_item.frame.shape, polygon)
+            # Track summaries are based on vehicles whose box intersects the detection ROI.
             vehicle_detections = suppress_duplicate_vehicle_tracks([
                 det for det in detections
                 if is_vehicle_detection(det)
@@ -1207,22 +1242,35 @@ def process_video_stream(
                 if is_vehicle_detection(det) and bbox_intersects_mask(det["bbox"], detection_mask)
             ]
             seen_keys = set()
+            should_run_lpr = ((stream_item.stream_frame_idx - 1) % detect_every_n_frames == 0)
 
             for det in inside_vehicle_detections:
                 track_id = det.get("track_id")
                 if track_id is None:
                     continue
-                display_track_id = _format_track_id(tracker_session_id, track_id)
-                key = _track_row_key(camera_id, tracker_session_id, track_id)
+                raw_key = _track_row_key(camera_id, tracker_session_id, track_id)
+                key = active_key_by_raw_key.get(raw_key)
+                if key is None:
+                    lifecycle_index = lifecycle_counts.get(raw_key, 0) + 1
+                    lifecycle_counts[raw_key] = lifecycle_index
+                    key = f"{raw_key}:{lifecycle_index}"
+                    active_key_by_raw_key[raw_key] = key
+                display_track_id = _format_track_id(
+                    tracker_session_id,
+                    track_id,
+                    lifecycle_counts.get(raw_key, 1),
+                )
                 seen_keys.add(key)
                 missing_counts[key] = 0
 
                 record = records.get(key)
                 if record is None:
+                    # New track: store timing, source file, best plate, and best screenshot as it evolves.
                     record = {
                         "camera_id": camera_id,
                         "track_id": display_track_id,
                         "raw_track_id": track_id,
+                        "raw_key": raw_key,
                         "start_datetime": stream_item.absolute_datetime,
                         "end_datetime": stream_item.absolute_datetime,
                         "start_source": stream_item.segment.rel_path,
@@ -1241,9 +1289,10 @@ def process_video_stream(
                 record["end_time_sec"] = stream_item.source_time_sec
                 record["last_bbox"] = det["bbox"]
 
-                if lpr_pipeline is None:
+                if lpr_pipeline is None or not should_run_lpr:
                     continue
 
+                # LPR is sampled by detect_every_n_frames and only run on the current vehicle crop.
                 recognitions = [item for item in lpr_pipeline.recognize(stream_item.frame, vehicle_detections=[det]) if item.text]
                 if not recognitions:
                     continue
@@ -1286,10 +1335,17 @@ def process_video_stream(
                 if key in seen_keys:
                     continue
                 missing_counts[key] = missing_counts.get(key, 0) + 1
+                if missing_counts[key] <= _stream_track_max_missing_frames(current_segment):
+                    continue
+                record = records.pop(key)
+                active_key_by_raw_key.pop(record.get("raw_key"), None)
+                missing_counts.pop(key, None)
+                completed_records.append(record)
 
         success_segments += len(segments)
 
-        for record in records.values():
+        for record in completed_records + list(records.values()):
+            # Emit exactly one summary row per completed/active track at camera end.
             plate = record.get("best_plate")
             row = _empty_log_row("track_summary", video_rel_path=record.get("video_rel_path", ""))
             row.update({
@@ -1396,6 +1452,7 @@ def process_video(
     status_cb=None,
     stop_checker=None
 ):
+    """Process one video file with ROI event intervals, screenshots, clips, and optional LPR."""
     logs = []
 
     cap = cv2.VideoCapture(video_path)
@@ -1482,6 +1539,7 @@ def process_video(
     lpr_suppressed_locations = []
 
     def flush_lpr_group(group):
+        """Commit the best candidate in a pending LPR group to logs/screenshots."""
         nonlocal grabbed_count
         best_candidate = select_lpr_group_candidate(group)
         if best_candidate is None:
@@ -1539,6 +1597,7 @@ def process_video(
                 status_cb(f"[LPR] 偵測區車輛辨識：{recognition.text}")
 
     def flush_due_lpr_groups(now_sec, force=False):
+        """Flush LPR groups once the aggregation window expires or at end-of-video."""
         remaining = []
         for group in lpr_pending_groups:
             if force or (now_sec - group["first_seen_sec"]) >= LPR_AGGREGATION_WINDOW_SEC:
@@ -1548,6 +1607,7 @@ def process_video(
         lpr_pending_groups[:] = remaining
 
     def is_lpr_text_suppressed(text, time_sec):
+        """Skip plate text recently emitted from the same video."""
         expired_texts = [
             suppressed_text
             for suppressed_text, suppress_until in lpr_suppressed_until.items()
@@ -1561,6 +1621,7 @@ def process_video(
         return False
 
     def is_lpr_location_suppressed(bbox, time_sec):
+        """Skip plate boxes from locations recently emitted from the same video."""
         active_locations = []
         suppressed = False
         for item in lpr_suppressed_locations:
@@ -1573,6 +1634,7 @@ def process_video(
         return suppressed
 
     def select_lpr_group_candidate(group):
+        """Choose the best candidate by majority-like text score and recognition quality."""
         candidates = group.get("candidates") or []
         if not candidates:
             return None
@@ -1590,6 +1652,7 @@ def process_video(
         return max(best_candidates, key=lambda candidate: candidate["quality"])
 
     def queue_lpr_recognitions(recognitions, frame, detections, frame_idx_value, time_sec):
+        """Group nearby/repeated recognitions before writing a final LPR event."""
         for recognition in recognitions:
             if not recognition.text:
                 continue
@@ -2007,6 +2070,8 @@ def process_video(
 # 一次填完全部參數的視窗
 # ---------------------------
 class ParamsDialog(tk.Toplevel):
+    """Legacy Tk dialog for collecting detection timing and inference parameters."""
+
     def __init__(
         self,
         parent,
@@ -2091,6 +2156,7 @@ class ParamsDialog(tk.Toplevel):
         self.ent_conf.focus_set()
 
     def on_ok(self):
+        """Validate user-entered numeric parameters before closing the dialog."""
         try:
             conf = float(self.ent_conf.get().strip())
             start_frames = int(self.ent_start.get().strip())
@@ -2134,6 +2200,8 @@ class ParamsDialog(tk.Toplevel):
 
 
 class PastePathsDialog(tk.Toplevel):
+    """Legacy Tk dialog for pasting multiple source file/folder paths."""
+
     def __init__(self, parent):
         super().__init__(parent)
         self.parent = parent
@@ -2172,6 +2240,8 @@ class PastePathsDialog(tk.Toplevel):
 # GUI App
 # ---------------------------
 class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
+    """Legacy Tk application retained for compatibility with older entry points."""
+
     def __init__(self):
         super().__init__()
         self.title("CCTV ROI AI Event Extractor（Polygon ROI）")
@@ -2223,6 +2293,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         self.after(80, self._poll_ui_queue)
 
     def _build_ui(self):
+        """Build the legacy Tk controls and wire button commands."""
         pad = 12
         frm = ttk.Frame(self, padding=pad)
         frm.pack(fill="both", expand=True)
@@ -2344,9 +2415,11 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         self._refresh_source_listbox()
 
     def _post_ui(self, action, **kwargs):
+        """Queue UI work from background threads so Tk updates stay on the main thread."""
         self.ui_queue.put((action, kwargs))
 
     def _poll_ui_queue(self):
+        """Apply queued UI updates and reschedule polling."""
         try:
             while True:
                 action, kwargs = self.ui_queue.get_nowait()
@@ -2418,6 +2491,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         self._refresh_source_listbox()
 
     def _split_dnd_items(self, raw: str):
+        """Split tkinterdnd2 drop payloads while preserving paths wrapped in braces."""
         items = []
         token = ""
         in_brace = False
@@ -2446,6 +2520,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         return [norm_path(x) for x in items if str(x).strip()]
 
     def _apply_source_selection(self, folders=None, files=None, append=False):
+        """Apply source selections and keep file/folder modes mutually exclusive."""
         folders = [norm_path(x) for x in (folders or []) if str(x).strip()]
         files = [norm_path(x) for x in (files or []) if str(x).strip()]
         files = [x for x in files if x.lower().endswith(self.video_exts)]
@@ -2503,6 +2578,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         PastePathsDialog(self)
 
     def apply_pasted_paths(self, raw_text: str):
+        """Parse pasted paths and add any valid supported sources."""
         lines = []
         normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
         for line in normalized.split("\n"):
@@ -2528,6 +2604,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
             messagebox.showwarning("未加入任何來源", "沒有偵測到有效的資料夾或支援影片檔。", parent=self)
 
     def on_drop_sources(self, event):
+        """Handle drag-and-drop source additions in the legacy Tk UI."""
         try:
             items = self._split_dnd_items(event.data)
             folders = [p for p in items if os.path.isdir(p)]
@@ -2637,6 +2714,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         self.update_idletasks()
 
     def _find_videos(self, exclude_dir=None):
+        """Find supported videos from current sources while excluding output folders."""
         exclude_dir_norm = norm_path(exclude_dir) if exclude_dir else None
 
         if self.input_mode == "files" and self.selected_video_files:
@@ -2690,6 +2768,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         return videos
 
     def _prepare_output_dirs(self, out_dir):
+        """Create output directories and update labels in the legacy UI."""
         self.excluded_dir = out_dir
         self.screenshots_root = os.path.join(out_dir, "screenshots")
         self.clips_root = os.path.join(out_dir, "motion_clips")
@@ -2711,6 +2790,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         )
 
     def _write_csv_log(self, rows):
+        """Write the legacy UI batch CSV log."""
         csv_path = os.path.join(self.logs_root, "detection_log.csv")
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(
@@ -2745,12 +2825,14 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         return csv_path
 
     def _write_summary_report(self, summary_text: str):
+        """Write the legacy UI run summary report."""
         report_path = os.path.join(self.reports_root, "report_summary.txt")
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(summary_text)
         return report_path
 
     def _ask_all_params(self):
+        """Open the parameter dialog and return its validated result."""
         dlg = ParamsDialog(
             self,
             confidence=self.confidence,
@@ -2765,6 +2847,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         return dlg.result
 
     def start_flow(self):
+        """Collect user choices, load model/ROI, and start the legacy worker thread."""
         if not self.export_screenshots_var.get() and not self.export_clips_var.get():
             messagebox.showwarning("未選擇輸出類型", "請至少勾選一種輸出類型：截圖或事件片段。", parent=self)
             return
@@ -2895,6 +2978,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
         self.worker_thread.start()
 
     def _run_batch(self, videos):
+        """Background worker for the legacy UI; posts progress/results through a queue."""
         run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.total_videos = len(videos)
         self.done_videos = 0
@@ -3042,6 +3126,7 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
 
 
 def main():
+    """Launch the legacy Tk GUI application."""
     app = App()
     app.mainloop()
 

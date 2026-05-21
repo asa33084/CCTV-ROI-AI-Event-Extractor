@@ -1,3 +1,5 @@
+"""Public API facade that re-exports processing, LPR, and report helpers."""
+
 from cctv_roi_ai_event_extractor.event_processing import (
     APP_VERSION,
     LONG_STAY_SCREENSHOT_INTERVAL_SEC,

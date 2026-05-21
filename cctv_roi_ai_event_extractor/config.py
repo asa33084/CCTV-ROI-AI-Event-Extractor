@@ -3,6 +3,7 @@ import sys
 from dataclasses import dataclass
 
 
+# 所有設定都先從環境變數讀取，讓打包後的 EXE 與開發環境可以共用同一套邏輯。
 APP_VERSION = "4.4.0-roi-yolo26x-dragdrop-paste-paths"
 
 ENV_APP_DIR = "CCTV_ROI_APP_DIR"
@@ -32,6 +33,7 @@ def _project_root() -> str:
 
 
 def resolve_app_dir() -> str:
+    """Resolve the directory used for models, ROI config, and runtime files."""
     env_value = os.getenv(ENV_APP_DIR)
     if env_value:
         return os.path.abspath(env_value)
@@ -41,6 +43,7 @@ def resolve_app_dir() -> str:
 
 
 def ensure_runtime_environment(app_dir: str | None = None) -> None:
+    """Keep third-party caches inside the app folder instead of the user profile."""
     base_dir = app_dir or resolve_app_dir()
     if not os.getenv(ENV_ULTRALYTICS_CONFIG_DIR):
         runtime_dir = os.path.join(base_dir, ".runtime", "ultralytics")
@@ -92,6 +95,8 @@ def resolve_int_env(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class AppConfig:
+    """Runtime configuration collected from environment variables."""
+
     app_dir: str
     model_path: str | None
     roi_config_path: str | None

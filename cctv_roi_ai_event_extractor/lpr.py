@@ -8,6 +8,7 @@ from cctv_roi_ai_event_extractor.config import ensure_runtime_environment, load_
 ensure_runtime_environment()
 
 
+# 台灣常見車牌格式。OCR 輸出會先被正規化，再用這些格式挑出最可信的候選字串。
 TAIWAN_PLATE_PATTERNS = (
     re.compile(r"^[A-Z]{3}[0-9]{4}$"),
     re.compile(r"^[A-Z]{2}[0-9]{4}$"),
@@ -45,12 +46,16 @@ DIGIT_SLOT_MAP = str.maketrans({
 
 @dataclass(frozen=True)
 class PlateCandidate:
+    """A detected plate region before OCR is applied."""
+
     bbox: tuple[int, int, int, int]
     score: float
 
 
 @dataclass(frozen=True)
 class PlateRecognition:
+    """Final plate recognition result with detector and OCR metadata."""
+
     text: str
     raw_text: str
     confidence: float
@@ -61,6 +66,7 @@ class PlateRecognition:
 
 
 def normalize_taiwan_plate_text(raw_text: str) -> str:
+    """Normalize OCR text and prefer candidates matching Taiwan plate layouts."""
     text = (raw_text or "").upper()
     text = re.sub(r"[^A-Z0-9]", "", text)
     if not text:
@@ -76,6 +82,7 @@ def normalize_taiwan_plate_text(raw_text: str) -> str:
 
 
 def _plate_text_candidates(text: str) -> list[str]:
+    """Generate full-string and sliding-window candidates for noisy OCR output."""
     candidates = []
 
     def add(value):
@@ -102,6 +109,7 @@ def _digits(value: str) -> str:
 
 
 def _taiwan_plate_position_candidates(text: str) -> list[str]:
+    """Correct common OCR confusions according to expected letter/digit slots."""
     candidates = []
     if len(text) == 7:
         candidates.append(_letters(text[:3]) + _digits(text[3:]))
@@ -127,6 +135,7 @@ def crop_bbox(frame, bbox, padding_ratio: float = 0.06):
 
 
 def crop_bbox_with_offset(frame, bbox, padding_ratio: float = 0.06):
+    """Crop a bounding box and return the crop plus its offset in the source frame."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = bbox
     bw = max(1, x2 - x1)
@@ -146,6 +155,7 @@ def rectify_plate_crop(plate_bgr):
     import cv2
     import numpy as np
 
+    # Use the strongest contour to deskew oblique plate crops before OCR.
     if plate_bgr is None or plate_bgr.size == 0:
         return plate_bgr
 
@@ -183,6 +193,8 @@ def rectify_plate_crop(plate_bgr):
 
 
 class YoloPlateDetector:
+    """YOLO wrapper that returns plate boxes in a small project-specific shape."""
+
     def __init__(self, model_path: str, conf: float = 0.35, device: str | None = None):
         from ultralytics import YOLO
 
@@ -205,6 +217,8 @@ class YoloPlateDetector:
 
 
 class OcrEngine:
+    """Null OCR engine used when LPR detection is enabled without text recognition."""
+
     name = "none"
 
     def recognize(self, image_bgr) -> tuple[str, float]:
@@ -269,6 +283,7 @@ def _unwrap_paddle_result(result) -> Mapping | None:
 
 
 def _extract_paddle_v3_text(result) -> tuple[str, float]:
+    """Read PaddleOCR 3.x result objects and keep text ordered from left to right."""
     data = _unwrap_paddle_result(result)
     if not data:
         return "", 0.0
@@ -297,6 +312,7 @@ def _extract_paddle_v3_text(result) -> tuple[str, float]:
 
 
 def _extract_paddle_legacy_text(results) -> tuple[str, float]:
+    """Read older PaddleOCR nested list output."""
     candidates = []
     for item in results or []:
         if not isinstance(item, (list, tuple)):
@@ -386,6 +402,7 @@ def _softmax(values, axis=-1):
 
 
 def ctc_decode(logits, charset: list[str], blank_index: int = 0) -> tuple[str, float]:
+    """Decode CTC logits by removing blanks and repeated consecutive classes."""
     import numpy as np
 
     arr = np.asarray(logits)
@@ -423,6 +440,8 @@ def ctc_decode(logits, charset: list[str], blank_index: int = 0) -> tuple[str, f
 
 
 class SvtrOcrEngine(OcrEngine):
+    """ONNX SVTR/Transformer OCR engine for plate text recognition."""
+
     name = "svtr"
 
     def __init__(self):
@@ -485,6 +504,8 @@ def create_ocr_engine(engine_name: str | None) -> OcrEngine:
 
 
 class LicensePlateRecognizer:
+    """Run plate detection, crop normalization, OCR, and Taiwan-format validation."""
+
     def __init__(
         self,
         plate_model_path: str,
@@ -510,6 +531,7 @@ class LicensePlateRecognizer:
         if vehicle_bboxes:
             plate_sources = []
             for vehicle_bbox in vehicle_bboxes:
+                # Detect plates inside each vehicle crop first, then map boxes back to the full frame.
                 crop_result = crop_bbox_with_offset(frame, vehicle_bbox, padding_ratio=0.02)
                 if crop_result is None:
                     continue
@@ -527,6 +549,7 @@ class LicensePlateRecognizer:
             crop = crop_bbox(frame, plate.bbox)
             if crop is None:
                 continue
+            # Rectification is best-effort; if no usable contour is found, the original crop is preserved.
             crop = rectify_plate_crop(crop)
             raw_text, ocr_conf = self.ocr.recognize(crop)
             text = normalize_taiwan_plate_text(raw_text)

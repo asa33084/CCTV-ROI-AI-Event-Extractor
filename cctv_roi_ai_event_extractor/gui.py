@@ -73,6 +73,7 @@ LPR_OCR_CHOICES = (
 
 
 def normalize_selectable_lpr_ocr_engine(engine_name: str | None) -> str:
+    """Normalize persisted OCR names to the values offered by the Qt combobox."""
     name = (engine_name or "").strip().lower()
     if name in {"svtr", "transformer"}:
         return "svtr"
@@ -80,6 +81,7 @@ def normalize_selectable_lpr_ocr_engine(engine_name: str | None) -> str:
 
 
 def write_csv_log(logs_root: str, rows):
+    """Write the batch log in UTF-8 with BOM so Excel opens Chinese headers correctly."""
     csv_path = os.path.join(logs_root, "detection_log.csv")
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
@@ -115,6 +117,7 @@ def write_csv_log(logs_root: str, rows):
 
 
 def write_summary_report(reports_root: str, summary_text: str):
+    """Persist the plain-text run summary next to the evidence workbook."""
     report_path = os.path.join(reports_root, "report_summary.txt")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(summary_text)
@@ -122,6 +125,7 @@ def write_summary_report(reports_root: str, summary_text: str):
 
 
 def format_ai_params_text(confidence, start_trigger_frames, end_hold_sec, pre_event_sec, post_event_sec, detect_width, detect_every_n_frames):
+    """Build the compact parameter summary shown in the main window."""
     return (
         f"AI參數：conf={confidence} | start_trigger_frames={start_trigger_frames} | "
         f"end_hold_sec={end_hold_sec} | pre={pre_event_sec} | post={post_event_sec} | "
@@ -130,6 +134,7 @@ def format_ai_params_text(confidence, start_trigger_frames, end_hold_sec, pre_ev
 
 
 def cv_to_qpixmap(frame_bgr):
+    """Convert an OpenCV BGR frame into a detached QPixmap for Qt widgets."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
     image = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
@@ -137,6 +142,8 @@ def cv_to_qpixmap(frame_bgr):
 
 
 class ParamsDialog(QDialog):
+    """Modal dialog for collecting all detection timing and inference parameters."""
+
     def __init__(self, parent, confidence, start_trigger_frames, end_hold_sec, pre_event_sec, post_event_sec, detect_width, detect_every_n_frames):
         super().__init__(parent)
         self.setWindowTitle("AI 參數設定")
@@ -212,6 +219,8 @@ class ParamsDialog(QDialog):
 
 
 class PastePathsDialog(QDialog):
+    """Dialog that lets users paste many source paths at once."""
+
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("貼上多個來源路徑")
@@ -244,6 +253,8 @@ class PastePathsDialog(QDialog):
 
 
 class SourceListWidget(QListWidget):
+    """Source list with drag-and-drop support for files and folders."""
+
     paths_dropped = Signal(list)
 
     def __init__(self, parent=None):
@@ -278,6 +289,8 @@ class SourceListWidget(QListWidget):
 
 
 class PolygonRoiView(QGraphicsView):
+    """Interactive image view for drawing polygon ROI points in original-frame coordinates."""
+
     def __init__(self, frame_bgr, preset_polygon=None, parent=None):
         super().__init__(parent)
         self.frame_bgr = frame_bgr
@@ -334,6 +347,7 @@ class PolygonRoiView(QGraphicsView):
         super().keyPressEvent(event)
 
     def refresh_overlay(self):
+        """Redraw polygon fill, numbered points, and help text after every edit."""
         for item in self.point_items + self.label_items:
             self.scene.removeItem(item)
         self.point_items = []
@@ -372,6 +386,8 @@ class PolygonRoiView(QGraphicsView):
 
 
 class PolygonRoiDialog(QDialog):
+    """Qt wrapper around PolygonRoiView that validates the final ROI."""
+
     def __init__(self, video_path, preset_polygon=None, parent=None, title="Polygon ROI 選取", description=None):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -431,6 +447,8 @@ class PolygonRoiDialog(QDialog):
 
 
 class BatchWorker(QObject):
+    """Runs video processing off the UI thread and reports progress through Qt signals."""
+
     status_changed = Signal(str)
     video_progress = Signal(int, int)
     frame_progress = Signal(int, int)
@@ -447,6 +465,8 @@ class BatchWorker(QObject):
 
     def run(self):
         try:
+            # The worker processes all videos as stitched camera streams, then converts
+            # backend log rows into the stable CSV schema used by the UI.
             run_time = self.config["run_time"]
             videos = self.config["videos"]
             total_videos = len(videos)
@@ -517,6 +537,8 @@ class BatchWorker(QObject):
 
 
 class MainWindow(QMainWindow):
+    """Main Qt application window for source selection, ROI setup, and batch execution."""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CCTV ROI AI Event Extractor (Qt)")
@@ -566,6 +588,7 @@ class MainWindow(QMainWindow):
         self.update_ai_label()
 
     def build_ui(self):
+        """Create all widgets and connect button actions."""
         central = QWidget()
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
@@ -790,6 +813,7 @@ class MainWindow(QMainWindow):
         self.txt_log.appendPlainText(f"[{timestamp}] {text}")
 
     def get_selected_device(self):
+        """Resolve the selected compute device, allowing manual text overrides."""
         manual_value = self.edt_device_override.text().strip()
         if manual_value:
             return manual_value, f"手動指定：{manual_value}"
@@ -805,6 +829,7 @@ class MainWindow(QMainWindow):
         return "cpu", "CPU"
 
     def refresh_source_list(self):
+        """Sync source mode state into the visible list and source label."""
         self.lst_sources.clear()
         if self.input_mode == "files":
             items = [("檔案", p) for p in self.selected_video_files]
@@ -825,6 +850,7 @@ class MainWindow(QMainWindow):
         self.lbl_folder.setText(label)
 
     def apply_source_selection(self, folders=None, files=None, append=False):
+        """Apply file/folder selections while de-duplicating paths and preserving mode."""
         folders = [norm_path(x) for x in (folders or []) if str(x).strip()]
         files = [norm_path(x) for x in (files or []) if str(x).strip()]
         files = [x for x in files if os.path.isfile(x) and x.lower().endswith(self.video_exts)]
@@ -883,6 +909,7 @@ class MainWindow(QMainWindow):
             self.apply_pasted_paths(dialog.get_text())
 
     def apply_pasted_paths(self, raw_text):
+        """Parse pasted lines into valid folders and supported video files."""
         lines = []
         normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
         for line in normalized.split("\n"):
@@ -906,6 +933,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未加入任何來源", "沒有偵測到有效的資料夾或支援影片檔。")
 
     def handle_dropped_paths(self, paths):
+        """Handle normalized paths emitted by SourceListWidget.dropEvent."""
         folders = [p for p in paths if os.path.isdir(p)]
         files = [p for p in paths if os.path.isfile(p) and p.lower().endswith(self.video_exts)]
         invalid = [p for p in paths if p not in folders and p not in files]
@@ -995,6 +1023,7 @@ class MainWindow(QMainWindow):
         self.set_status("已清空來源，恢復為程式資料夾")
 
     def find_videos(self, exclude_dir=None):
+        """Collect supported videos from the selected source mode, excluding output paths."""
         exclude_dir_norm = norm_path(exclude_dir) if exclude_dir else None
         if self.input_mode == "files" and self.selected_video_files:
             videos = []
@@ -1041,6 +1070,7 @@ class MainWindow(QMainWindow):
         return videos
 
     def prepare_output_dirs(self, out_dir):
+        """Create the output folder structure and remember it for the run."""
         self.excluded_dir = out_dir
         self.screenshots_root = os.path.join(out_dir, "screenshots")
         self.clips_root = os.path.join(out_dir, "motion_clips")
@@ -1057,6 +1087,7 @@ class MainWindow(QMainWindow):
         self.lbl_out.setText(f"輸出結構：{self.screenshots_root} | {self.clips_root} | {self.logs_root} | {self.reports_root}")
 
     def set_controls_enabled(self, enabled):
+        """Disable source and option controls while the background worker is running."""
         for widget in (
             self.btn_pick_input,
             self.btn_add_input_dir,
@@ -1095,6 +1126,7 @@ class MainWindow(QMainWindow):
         return None
 
     def start_flow(self):
+        """Validate inputs, collect ROI/params, load models, and start the worker thread."""
         if not self.chk_export_screenshots.isChecked() and not self.chk_export_clips.isChecked():
             QMessageBox.warning(self, "未選擇輸出類型", "請至少勾選一種輸出類型：截圖或事件片段。")
             return
@@ -1277,6 +1309,7 @@ class MainWindow(QMainWindow):
 
         self.worker_thread = QThread(self)
         self.worker = BatchWorker(config)
+        # Keep heavy processing in BatchWorker so the Qt event loop stays responsive.
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.status_changed.connect(self.set_status)
@@ -1308,6 +1341,7 @@ class MainWindow(QMainWindow):
         self.set_status("待命")
 
     def on_worker_finished(self, result):
+        """Write reports, restore UI controls, and show the final completion message."""
         csv_path = write_csv_log(self.logs_root, result["csv_rows"])
         evidence_path = os.path.join(self.reports_root, "evidence_report.xlsx")
         evidence_path, evidence_count = write_evidence_workbook(evidence_path, result["csv_rows"])
@@ -1375,6 +1409,7 @@ class MainWindow(QMainWindow):
         )
 
     def cleanup_worker(self):
+        """Release QObject/QThread references after the worker thread exits."""
         if self.worker is not None:
             self.worker.deleteLater()
             self.worker = None
@@ -1395,6 +1430,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    """Launch the Qt GUI application."""
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

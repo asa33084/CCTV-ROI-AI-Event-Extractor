@@ -18,6 +18,8 @@ _P_CAMERA_PATTERN = re.compile(
 
 @dataclass(frozen=True)
 class VideoSegment:
+    """Metadata for one physical video file in a camera timeline."""
+
     path: str
     rel_path: str
     camera_id: str
@@ -31,6 +33,8 @@ class VideoSegment:
 
 @dataclass(frozen=True)
 class StreamFrame:
+    """Frame yielded from a stitched camera stream with both local and stream timing."""
+
     frame: object
     segment: VideoSegment
     local_frame_idx: int
@@ -47,6 +51,7 @@ def _clean_camera_id(value: str | None, fallback: str = "camera") -> str:
 
 
 def parse_video_filename(path: str, rel_path: str | None = None) -> VideoSegment:
+    """Infer camera id and timestamps from supported CCTV filename patterns."""
     name = os.path.splitext(os.path.basename(path or ""))[0]
     rel = rel_path or os.path.basename(path or "")
 
@@ -94,6 +99,7 @@ def parse_video_filename(path: str, rel_path: str | None = None) -> VideoSegment
 
 
 def load_video_segment_metadata(segment: VideoSegment) -> VideoSegment:
+    """Open the video once to fill FPS, frame count, dimensions, and inferred end time."""
     import cv2
 
     cap = cv2.VideoCapture(segment.path)
@@ -129,6 +135,7 @@ def build_video_segments(
     input_dir: str | None = None,
     load_metadata: bool = True,
 ) -> list[VideoSegment]:
+    """Build and sort video segments so each camera can be processed chronologically."""
     segments = []
     for path in video_paths:
         rel_path = os.path.relpath(path, input_dir) if input_dir else os.path.basename(path)
@@ -147,6 +154,8 @@ def build_video_segments(
 
 
 class VideoStreamServer:
+    """Groups video files by camera and yields frames as continuous camera streams."""
+
     def __init__(self, segments: Iterable[VideoSegment]):
         self.segments = list(segments)
 
@@ -179,6 +188,7 @@ class VideoStreamServer:
     def frames_for_camera(self, camera_id: str, segments: Iterable[VideoSegment]) -> Iterator[StreamFrame]:
         import cv2
 
+        # stream_frame_idx resets per camera; local_frame_idx resets for each segment.
         stream_frame_idx = 0
         for segment in segments:
             cap = cv2.VideoCapture(segment.path)
