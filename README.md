@@ -9,6 +9,8 @@
 - 偵測 `person`、`car`、`motorcycle`、`bus`、`truck`
 - 只有當目標底部中心點進入偵測區並連續達到門檻幀數時，才判定事件開始
 - 啟用車牌辨識時，會辨識偵測區內的所有車輛，不依賴觸碰區或連續追蹤
+- 影片讀取器會依 CCTV 檔名解析時間序，並讓不同鏡頭各自維持 YOLO track
+- Stream 流程會將車牌辨識結果綁定 vehicle `track_id`，紀錄 track 進入與離開時間
 - 可輸出事件截圖、事件片段、CSV 日誌與文字摘要報表
 - 長時間停留補抓截圖可在 GUI 中獨立開關
 - 可輸出蒐證 Excel，欄位為 `編號`、`進入日期`、`出去日期`、`車號`、`車輛截圖`
@@ -31,6 +33,7 @@
 |  |- evidence_report.py
 |  |- gui.py
 |  |- lpr.py
+|  |- video_stream.py
 |  `- qt_app.py
 |- .env.example
 |- cctv_roi_ai_event_extractor_legacy_backend.py
@@ -48,6 +51,7 @@
 - `cctv_roi_ai_event_extractor/evidence_report.py`：蒐證 Excel 輸出與截圖嵌入
 - `cctv_roi_ai_event_extractor/gui.py`：Qt GUI
 - `cctv_roi_ai_event_extractor/lpr.py`：車牌偵測、校正、OCR 介面、臺灣格式校正
+- `cctv_roi_ai_event_extractor/video_stream.py`：CCTV 檔名時間解析、鏡頭分組、依時間序輸出影格
 - `cctv_roi_ai_event_extractor/qt_app.py`：舊 package 入口相容檔
 - `cctv_roi_ai_event_extractor_qt.py`：相容啟動檔
 - `cctv_roi_ai_event_extractor_v4_new.py`：相容 re-export 檔
@@ -275,6 +279,20 @@ output_root/
 
 ```text
 plate_text, plate_raw_text, plate_confidence, plate_bbox, plate_valid_taiwan_format, plate_ocr_engine
+```
+
+Stream / track 流程會另外輸出：
+
+```text
+camera_id, track_id, track_start_datetime, track_end_datetime, track_start_source, track_end_source
+```
+
+目前支援的 CCTV 時間檔名範例：
+
+```text
+mpb-bm001_20260515—134200
+P260329_134105_134605
+20260409_121648
 ```
 
 另外 ROI 設定會儲存在程式同層。新版設定包含 `detection_polygon`，可選擇保留 `touch_polygon`，仍相容舊版 `polygon`：

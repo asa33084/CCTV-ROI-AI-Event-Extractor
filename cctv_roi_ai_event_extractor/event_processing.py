@@ -61,6 +61,7 @@ from cctv_roi_ai_event_extractor.config import (
     load_config,
 )
 from cctv_roi_ai_event_extractor.lpr import draw_plate_recognitions
+from cctv_roi_ai_event_extractor.video_stream import VideoStreamServer
 
 ensure_runtime_environment()
 
@@ -75,6 +76,8 @@ LPR_AGGREGATION_WINDOW_SEC = 20.0
 LPR_DUPLICATE_SUPPRESS_SEC = 20.0
 LPR_LOCATION_SUPPRESS_SEC = 60.0
 LPR_LOCATION_IOU_THRESHOLD = 0.10
+STREAM_TRACK_RESET_GAP_SEC = 2.0
+VEHICLE_TRACK_DUPLICATE_IOU_THRESHOLD = 0.70
 
 
 # ---------------------------
@@ -609,6 +612,62 @@ class ObjectDetector:
 
         return detections
 
+    def reset_trackers(self):
+        predictor = getattr(self.model, "predictor", None)
+        trackers = getattr(predictor, "trackers", None) if predictor is not None else None
+        for tracker in trackers or []:
+            reset = getattr(tracker, "reset", None)
+            if callable(reset):
+                reset()
+
+    def track(self, frame, persist=True):
+        detect_frame, scale_x, scale_y = self._prepare_detect_frame(frame)
+        results = self.model.track(
+            detect_frame,
+            conf=self.conf,
+            verbose=False,
+            device=self.device,
+            persist=bool(persist),
+        )
+        detections = []
+
+        for result in results:
+            boxes = result.boxes
+            names = result.names
+            if boxes is None:
+                continue
+
+            for box in boxes:
+                cls_id = int(box.cls[0].item())
+                cls_name = names.get(cls_id, str(cls_id))
+                score = float(box.conf[0].item())
+
+                if cls_name not in self.target_classes:
+                    continue
+
+                track_id = None
+                if getattr(box, "id", None) is not None:
+                    try:
+                        track_id = int(box.id[0].item())
+                    except Exception:
+                        track_id = None
+                if track_id is None:
+                    continue
+
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                x1 = int(round(x1 * scale_x))
+                y1 = int(round(y1 * scale_y))
+                x2 = int(round(x2 * scale_x))
+                y2 = int(round(y2 * scale_y))
+                detections.append({
+                    "class_name": cls_name,
+                    "score": score,
+                    "bbox": (x1, y1, x2, y2),
+                    "track_id": track_id,
+                })
+
+        return detections
+
 
 # ---------------------------
 # ROI / 繪圖工具
@@ -660,6 +719,15 @@ def crop_bbox_from_frame(frame, bbox):
 
 def is_vehicle_detection(det):
     return det.get("class_name") in {"car", "motorcycle", "bus", "truck"}
+
+
+def suppress_duplicate_vehicle_tracks(detections, iou_threshold=VEHICLE_TRACK_DUPLICATE_IOU_THRESHOLD):
+    kept = []
+    for det in sorted(detections, key=lambda item: float(item.get("score", 0.0)), reverse=True):
+        if any(bbox_iou(det["bbox"], existing["bbox"]) >= iou_threshold for existing in kept):
+            continue
+        kept.append(det)
+    return kept
 
 
 def plate_text_distance(a, b):
@@ -973,6 +1041,334 @@ def export_interval_clip(
     if status_cb:
         status_cb(f"[CLIP-DONE] {os.path.basename(out_path)}")
     return True, out_path
+
+
+def _format_datetime(value):
+    if value is None:
+        return ""
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _track_row_key(camera_id, tracker_session_id, track_id):
+    return f"{camera_id}:{tracker_session_id}:{track_id}"
+
+
+def _format_track_id(tracker_session_id, track_id):
+    if tracker_session_id <= 1:
+        return str(track_id)
+    return f"{tracker_session_id}-{track_id}"
+
+
+def _segment_gap_sec(previous_segment, current_segment):
+    if (
+        previous_segment is None
+        or previous_segment.end_datetime is None
+        or current_segment.start_datetime is None
+    ):
+        return None
+    return (current_segment.start_datetime - previous_segment.end_datetime).total_seconds()
+
+
+def _empty_log_row(record_type, video_rel_path="", status="OK"):
+    return {
+        "type": record_type,
+        "video_rel_path": video_rel_path,
+        "event_time_sec": "",
+        "interval_start_sec": "",
+        "interval_end_sec": "",
+        "output_path": "",
+        "status": status,
+        "camera_id": "",
+        "track_id": "",
+        "track_start_datetime": "",
+        "track_end_datetime": "",
+        "track_start_source": "",
+        "track_end_source": "",
+        "plate_text": "",
+        "plate_raw_text": "",
+        "plate_confidence": "",
+        "plate_bbox": "",
+        "plate_valid_taiwan_format": "",
+        "plate_ocr_engine": "",
+    }
+
+
+def process_video_stream(
+    video_paths,
+    input_dir: str,
+    screenshots_root: str,
+    clips_root: str,
+    polygon,
+    detector,
+    start_trigger_frames: int,
+    end_hold_sec: float,
+    pre_event_sec: float,
+    post_event_sec: float,
+    draw_roi_on_screenshot: bool,
+    export_screenshots: bool,
+    export_clips: bool,
+    detect_every_n_frames: int,
+    lpr_pipeline=None,
+    touch_polygon=None,
+    export_long_stay_screenshots: bool = True,
+    progress_cb=None,
+    status_cb=None,
+    stop_checker=None,
+):
+    del start_trigger_frames, end_hold_sec, pre_event_sec, post_event_sec
+    del touch_polygon, export_long_stay_screenshots
+
+    logs = []
+    grabbed_count = 0
+    clip_count = 0
+    processed_frames = 0
+    detect_every_n_frames = max(1, int(detect_every_n_frames))
+    polygon_np = np.array(polygon, dtype=np.int32)
+
+    stream = VideoStreamServer.from_paths(video_paths, input_dir=input_dir, load_metadata=True)
+    total_frames = stream.total_frames
+    segments_by_rel_path = {segment.rel_path: segment for segment in stream.segments}
+
+    if status_cb:
+        cameras = ", ".join(stream.camera_ids) or "N/A"
+        status_cb(f"[STREAM] 影片讀取器啟動 | cameras={cameras} | videos={len(stream.segments)}")
+        if export_clips:
+            status_cb("[STREAM] 事件片段會以 track start/end 輸出；跨檔 track 先略過片段。")
+
+    skipped_segments = 0
+    success_segments = 0
+    clip_index = 0
+
+    for camera_id, segments in stream.iter_camera_segments():
+        detector.reset_trackers()
+        records = {}
+        missing_counts = {}
+        first_track_frame = True
+        current_segment = None
+        tracker_session_id = 1
+
+        if status_cb:
+            status_cb(f"[STREAM] camera={camera_id} | segments={len(segments)} | track reset")
+
+        for stream_item in stream.frames_for_camera(camera_id, segments):
+            if stop_checker and stop_checker():
+                if status_cb:
+                    status_cb("[STOP] 已停止 stream 處理")
+                return {
+                    "status": "STOPPED",
+                    "grabbed_count": grabbed_count,
+                    "clip_count": clip_count,
+                    "fps": 0,
+                    "width": 0,
+                    "height": 0,
+                    "frames": total_frames,
+                    "logs": logs,
+                    "total_videos": len(stream.segments),
+                    "success_count": success_segments,
+                    "skipped_count": skipped_segments,
+                    "stopped_count": 1,
+                }
+
+            if stream_item.segment != current_segment:
+                gap_sec = _segment_gap_sec(current_segment, stream_item.segment)
+                should_reset = current_segment is not None and (
+                    gap_sec is None or gap_sec > STREAM_TRACK_RESET_GAP_SEC
+                )
+                if should_reset:
+                    tracker_session_id += 1
+                    detector.reset_trackers()
+                    first_track_frame = True
+                current_segment = stream_item.segment
+                if status_cb:
+                    if should_reset:
+                        status_cb(
+                            f"[STREAM] camera={camera_id} segment={current_segment.rel_path} | "
+                            f"track reset gap={gap_sec if gap_sec is not None else 'unknown'}s"
+                        )
+                    else:
+                        status_cb(f"[STREAM] camera={camera_id} segment={current_segment.rel_path} | track persist")
+
+            processed_frames += 1
+            if progress_cb and processed_frames % 10 == 0:
+                progress_cb(processed_frames, total_frames)
+
+            if (stream_item.stream_frame_idx - 1) % detect_every_n_frames != 0:
+                continue
+
+            detections = detector.track(stream_item.frame, persist=not first_track_frame)
+            first_track_frame = False
+            detection_mask = make_polygon_mask(stream_item.frame.shape, polygon)
+            vehicle_detections = suppress_duplicate_vehicle_tracks([
+                det for det in detections
+                if is_vehicle_detection(det)
+            ])
+            inside_vehicle_detections = [
+                det for det in vehicle_detections
+                if is_vehicle_detection(det) and bbox_intersects_mask(det["bbox"], detection_mask)
+            ]
+            seen_keys = set()
+
+            for det in inside_vehicle_detections:
+                track_id = det.get("track_id")
+                if track_id is None:
+                    continue
+                display_track_id = _format_track_id(tracker_session_id, track_id)
+                key = _track_row_key(camera_id, tracker_session_id, track_id)
+                seen_keys.add(key)
+                missing_counts[key] = 0
+
+                record = records.get(key)
+                if record is None:
+                    record = {
+                        "camera_id": camera_id,
+                        "track_id": display_track_id,
+                        "raw_track_id": track_id,
+                        "start_datetime": stream_item.absolute_datetime,
+                        "end_datetime": stream_item.absolute_datetime,
+                        "start_source": stream_item.segment.rel_path,
+                        "end_source": stream_item.segment.rel_path,
+                        "start_time_sec": stream_item.source_time_sec,
+                        "end_time_sec": stream_item.source_time_sec,
+                        "video_rel_path": stream_item.segment.rel_path,
+                        "best_quality": -1.0,
+                        "best_plate": None,
+                        "best_screenshot_path": "",
+                    }
+                    records[key] = record
+
+                record["end_datetime"] = stream_item.absolute_datetime
+                record["end_source"] = stream_item.segment.rel_path
+                record["end_time_sec"] = stream_item.source_time_sec
+                record["last_bbox"] = det["bbox"]
+
+                if lpr_pipeline is None:
+                    continue
+
+                recognitions = [item for item in lpr_pipeline.recognize(stream_item.frame, vehicle_detections=[det]) if item.text]
+                if not recognitions:
+                    continue
+                recognition = max(recognitions, key=plate_recognition_quality)
+                quality = plate_recognition_quality(recognition)
+                if quality <= record["best_quality"]:
+                    continue
+
+                record["best_quality"] = quality
+                record["best_plate"] = recognition
+
+                if export_screenshots:
+                    rel_dir = os.path.dirname(stream_item.segment.rel_path)
+                    screenshot_out_dir = os.path.join(screenshots_root, rel_dir)
+                    ensure_dir(screenshot_out_dir)
+                    base_name = os.path.splitext(os.path.basename(stream_item.segment.path))[0]
+                    screenshot_frame = build_screenshot_frame(
+                        frame=stream_item.frame,
+                        detections=detections,
+                        polygon=polygon,
+                        polygon_np=polygon_np,
+                        draw_roi_on_screenshot=draw_roi_on_screenshot,
+                        plate_recognitions=[recognition],
+                    )
+                    ok_save, shot_path = save_frame(
+                        screenshot_out_dir,
+                        base_name,
+                        stream_item.source_time_sec,
+                        stream_item.local_frame_idx,
+                        screenshot_frame,
+                    )
+                    if ok_save:
+                        grabbed_count += 1
+                        record["best_screenshot_path"] = shot_path
+
+                if status_cb:
+                    status_cb(f"[TRACK-LPR] camera={camera_id} track={display_track_id} plate={recognition.text}")
+
+            for key in list(records):
+                if key in seen_keys:
+                    continue
+                missing_counts[key] = missing_counts.get(key, 0) + 1
+
+        success_segments += len(segments)
+
+        for record in records.values():
+            plate = record.get("best_plate")
+            row = _empty_log_row("track_summary", video_rel_path=record.get("video_rel_path", ""))
+            row.update({
+                "event_time_sec": f'{record.get("start_time_sec", 0.0):.2f}',
+                "interval_start_sec": f'{record.get("start_time_sec", 0.0):.2f}',
+                "interval_end_sec": f'{record.get("end_time_sec", 0.0):.2f}',
+                "output_path": record.get("best_screenshot_path", ""),
+                "camera_id": record["camera_id"],
+                "track_id": str(record["track_id"]),
+                "track_start_datetime": _format_datetime(record.get("start_datetime")),
+                "track_end_datetime": _format_datetime(record.get("end_datetime")),
+                "track_start_source": record.get("start_source", ""),
+                "track_end_source": record.get("end_source", ""),
+            })
+            if plate is not None:
+                row.update({
+                    "plate_text": plate.text,
+                    "plate_raw_text": plate.raw_text,
+                    "plate_confidence": f"{plate.confidence:.3f}",
+                    "plate_bbox": ",".join(str(v) for v in plate.bbox),
+                    "plate_valid_taiwan_format": "Y" if plate.valid_taiwan_format else "N",
+                    "plate_ocr_engine": lpr_pipeline.engine_name if lpr_pipeline is not None else "",
+                })
+
+            if export_clips and record.get("start_source") == record.get("end_source"):
+                segment = segments_by_rel_path.get(record.get("start_source"))
+                if segment is not None:
+                    clip_index += 1
+                    rel_dir = os.path.dirname(segment.rel_path)
+                    clip_out_dir = os.path.join(clips_root, rel_dir)
+                    base_name = os.path.splitext(os.path.basename(segment.path))[0]
+                    ok_clip, clip_path = export_interval_clip(
+                        video_path=segment.path,
+                        clip_out_dir=clip_out_dir,
+                        base_name=f"{base_name}__track{record['track_id']}",
+                        start_t=max(0.0, float(record.get("start_time_sec", 0.0))),
+                        end_t=max(
+                            float(record.get("start_time_sec", 0.0)),
+                            float(record.get("end_time_sec", 0.0)),
+                        ),
+                        clip_index=clip_index,
+                        status_cb=status_cb,
+                    )
+                    if ok_clip:
+                        clip_count += 1
+                        if not row.get("output_path"):
+                            row["output_path"] = clip_path or ""
+                elif status_cb:
+                    status_cb(f"[CLIP-SKIP] 找不到 track 來源影片：{record.get('start_source')}")
+            elif export_clips and record.get("start_source") != record.get("end_source") and status_cb:
+                status_cb(
+                    f"[CLIP-SKIP] track #{record['track_id']} 跨檔案，暫不輸出合併片段："
+                    f"{record.get('start_source')} -> {record.get('end_source')}"
+                )
+            logs.append(row)
+
+    if progress_cb:
+        progress_cb(total_frames if total_frames > 0 else processed_frames, total_frames)
+
+    if status_cb:
+        status_cb(
+            f"[STREAM-DONE] tracks={sum(1 for item in logs if item.get('type') == 'track_summary')} "
+            f"screenshots={grabbed_count} clips={clip_count}"
+        )
+
+    return {
+        "status": "OK",
+        "grabbed_count": grabbed_count,
+        "clip_count": clip_count,
+        "fps": 0,
+        "width": 0,
+        "height": 0,
+        "frames": total_frames,
+        "logs": logs,
+        "total_videos": len(stream.segments),
+        "success_count": success_segments,
+        "skipped_count": skipped_segments,
+        "stopped_count": 0,
+    }
 
 
 # ---------------------------
@@ -2328,13 +2724,20 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
                     "interval_end_sec",
                     "output_path",
                     "status",
+                    "camera_id",
+                    "track_id",
+                    "track_start_datetime",
+                    "track_end_datetime",
+                    "track_start_source",
+                    "track_end_source",
                     "plate_text",
                     "plate_raw_text",
                     "plate_confidence",
                     "plate_bbox",
                     "plate_valid_taiwan_format",
                     "plate_ocr_engine",
-                ]
+                ],
+                extrasaction="ignore",
             )
             writer.writeheader()
             for row in rows:
@@ -2559,6 +2962,12 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
                     "interval_end_sec": item["interval_end_sec"],
                     "output_path": item["output_path"],
                     "status": item["status"],
+                    "camera_id": item.get("camera_id", ""),
+                    "track_id": item.get("track_id", ""),
+                    "track_start_datetime": item.get("track_start_datetime", ""),
+                    "track_end_datetime": item.get("track_end_datetime", ""),
+                    "track_start_source": item.get("track_start_source", ""),
+                    "track_end_source": item.get("track_end_source", ""),
                     "plate_text": item.get("plate_text", ""),
                     "plate_raw_text": item.get("plate_raw_text", ""),
                     "plate_confidence": item.get("plate_confidence", ""),

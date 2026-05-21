@@ -57,6 +57,7 @@ from cctv_roi_ai_event_extractor.core import (
     norm_path,
     polygon_bbox,
     process_video,
+    process_video_stream,
     resolve_default_model_path,
     safe_relpath,
     save_roi_regions,
@@ -92,6 +93,12 @@ def write_csv_log(logs_root: str, rows):
                 "interval_end_sec",
                 "output_path",
                 "status",
+                "camera_id",
+                "track_id",
+                "track_start_datetime",
+                "track_end_datetime",
+                "track_start_source",
+                "track_end_source",
                 "plate_text",
                 "plate_raw_text",
                 "plate_confidence",
@@ -99,6 +106,7 @@ def write_csv_log(logs_root: str, rows):
                 "plate_valid_taiwan_format",
                 "plate_ocr_engine",
             ],
+            extrasaction="ignore",
         )
         writer.writeheader()
         for row in rows:
@@ -442,88 +450,65 @@ class BatchWorker(QObject):
             run_time = self.config["run_time"]
             videos = self.config["videos"]
             total_videos = len(videos)
-            total_grabbed = 0
-            total_clips = 0
-            success_count = 0
-            skipped_count = 0
-            stopped_count = 0
             csv_rows = []
 
             self.video_progress.emit(0, total_videos)
 
-            for i, vp in enumerate(videos, start=1):
-                if self.stop_requested:
-                    self.status_changed.emit("已停止")
-                    break
+            result = process_video_stream(
+                video_paths=videos,
+                input_dir=self.config["input_dir"],
+                screenshots_root=self.config["screenshots_root"],
+                clips_root=self.config["clips_root"],
+                polygon=self.config["polygon"],
+                detector=self.config["detector"],
+                start_trigger_frames=self.config["start_trigger_frames"],
+                end_hold_sec=self.config["end_hold_sec"],
+                pre_event_sec=self.config["pre_event_sec"],
+                post_event_sec=self.config["post_event_sec"],
+                draw_roi_on_screenshot=self.config["draw_roi_on_screenshot"],
+                export_screenshots=self.config["export_screenshots"],
+                export_clips=self.config["export_clips"],
+                detect_every_n_frames=self.config["detect_every_n_frames"],
+                lpr_pipeline=self.config.get("lpr_pipeline"),
+                touch_polygon=self.config.get("touch_polygon"),
+                export_long_stay_screenshots=self.config.get("export_long_stay_screenshots", True),
+                progress_cb=lambda frame_idx, total_frames: self.frame_progress.emit(frame_idx, total_frames),
+                status_cb=self.status_changed.emit,
+                stop_checker=lambda: self.stop_requested,
+            )
 
-                rel_name = safe_relpath(vp, self.config["input_dir"])
-                self.status_changed.emit(f"處理中：{rel_name}（{i}/{total_videos}）")
-
-                result = process_video(
-                    video_path=vp,
-                    rel_video_path=rel_name,
-                    screenshots_root=self.config["screenshots_root"],
-                    clips_root=self.config["clips_root"],
-                    polygon=self.config["polygon"],
-                    detector=self.config["detector"],
-                    start_trigger_frames=self.config["start_trigger_frames"],
-                    end_hold_sec=self.config["end_hold_sec"],
-                    pre_event_sec=self.config["pre_event_sec"],
-                    post_event_sec=self.config["post_event_sec"],
-                    draw_roi_on_screenshot=self.config["draw_roi_on_screenshot"],
-                    export_screenshots=self.config["export_screenshots"],
-                    export_clips=self.config["export_clips"],
-                    detect_every_n_frames=self.config["detect_every_n_frames"],
-                    lpr_pipeline=self.config.get("lpr_pipeline"),
-                    touch_polygon=self.config.get("touch_polygon"),
-                    export_long_stay_screenshots=self.config.get("export_long_stay_screenshots", True),
-                    progress_cb=lambda frame_idx, total_frames: self.frame_progress.emit(frame_idx, total_frames),
-                    status_cb=self.status_changed.emit,
-                    stop_checker=lambda: self.stop_requested,
-                )
-
-                if result["status"] == "OK":
-                    success_count += 1
-                elif result["status"] == "STOPPED":
-                    stopped_count += 1
-                else:
-                    skipped_count += 1
-
-                total_grabbed += result["grabbed_count"]
-                total_clips += result["clip_count"]
-
-                for item in result["logs"]:
-                    csv_rows.append({
-                        "run_time": run_time,
-                        "video_rel_path": item["video_rel_path"],
-                        "record_type": item["type"],
-                        "event_time_sec": item["event_time_sec"],
-                        "interval_start_sec": item["interval_start_sec"],
-                        "interval_end_sec": item["interval_end_sec"],
-                        "output_path": item["output_path"],
-                        "status": item["status"],
-                        "plate_text": item.get("plate_text", ""),
-                        "plate_raw_text": item.get("plate_raw_text", ""),
-                        "plate_confidence": item.get("plate_confidence", ""),
-                        "plate_bbox": item.get("plate_bbox", ""),
-                        "plate_valid_taiwan_format": item.get("plate_valid_taiwan_format", ""),
-                        "plate_ocr_engine": item.get("plate_ocr_engine", ""),
-                    })
-
-                self.video_progress.emit(i, total_videos)
-
-                if self.stop_requested:
-                    self.status_changed.emit("已停止")
-                    break
+            for item in result["logs"]:
+                csv_rows.append({
+                    "run_time": run_time,
+                    "video_rel_path": item["video_rel_path"],
+                    "record_type": item["type"],
+                    "event_time_sec": item["event_time_sec"],
+                    "interval_start_sec": item["interval_start_sec"],
+                    "interval_end_sec": item["interval_end_sec"],
+                    "output_path": item["output_path"],
+                    "status": item["status"],
+                    "camera_id": item.get("camera_id", ""),
+                    "track_id": item.get("track_id", ""),
+                    "track_start_datetime": item.get("track_start_datetime", ""),
+                    "track_end_datetime": item.get("track_end_datetime", ""),
+                    "track_start_source": item.get("track_start_source", ""),
+                    "track_end_source": item.get("track_end_source", ""),
+                    "plate_text": item.get("plate_text", ""),
+                    "plate_raw_text": item.get("plate_raw_text", ""),
+                    "plate_confidence": item.get("plate_confidence", ""),
+                    "plate_bbox": item.get("plate_bbox", ""),
+                    "plate_valid_taiwan_format": item.get("plate_valid_taiwan_format", ""),
+                    "plate_ocr_engine": item.get("plate_ocr_engine", ""),
+                })
 
             self.finished.emit({
                 "run_time": run_time,
                 "total_videos": total_videos,
-                "success_count": success_count,
-                "skipped_count": skipped_count,
-                "stopped_count": stopped_count,
-                "total_grabbed": total_grabbed,
-                "total_clips": total_clips,
+                "success_count": result.get("success_count", 0),
+                "skipped_count": result.get("skipped_count", 0),
+                "stopped_count": result.get("stopped_count", 0),
+                "total_grabbed": result["grabbed_count"],
+                "total_clips": result["clip_count"],
                 "csv_rows": csv_rows,
                 "stopped": self.stop_requested,
             })
