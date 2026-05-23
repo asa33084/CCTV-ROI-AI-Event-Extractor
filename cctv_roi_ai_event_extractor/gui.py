@@ -96,11 +96,14 @@ def write_csv_log(logs_root: str, rows):
                 "output_path",
                 "status",
                 "camera_id",
+                "stream_id",
                 "track_id",
                 "track_start_datetime",
                 "track_end_datetime",
                 "track_start_source",
                 "track_end_source",
+                "track_seen_frames",
+                "track_duration_sec",
                 "plate_text",
                 "plate_raw_text",
                 "plate_confidence",
@@ -141,6 +144,28 @@ def cv_to_qpixmap(frame_bgr):
     return QPixmap.fromImage(image.copy())
 
 
+class DebugStreamPreviewDialog(QDialog):
+    """Main-thread Qt preview for frames produced by the stream tracking worker."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CCTV Stream YOLO Track Debug")
+        self.resize(960, 540)
+
+        layout = QVBoxLayout(self)
+        self.label = QLabel("等待 debug frame...")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setMinimumSize(640, 360)
+        layout.addWidget(self.label)
+
+    def update_frame(self, frame_bgr):
+        pixmap = cv_to_qpixmap(frame_bgr)
+        target = self.label.size()
+        if target.width() > 0 and target.height() > 0:
+            pixmap = pixmap.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self.label.setPixmap(pixmap)
+
+
 class ParamsDialog(QDialog):
     """Modal dialog for collecting all detection timing and inference parameters."""
 
@@ -178,13 +203,13 @@ class ParamsDialog(QDialog):
         self.spin_pre.setRange(0.0, 999999.0)
         self.spin_pre.setDecimals(2)
         self.spin_pre.setValue(float(pre_event_sec))
-        form.addRow("事件前保留秒數：", self.spin_pre)
+        form.addRow("事件中心前保留秒數：", self.spin_pre)
 
         self.spin_post = QDoubleSpinBox()
         self.spin_post.setRange(0.0, 999999.0)
         self.spin_post.setDecimals(2)
         self.spin_post.setValue(float(post_event_sec))
-        form.addRow("事件後保留秒數：", self.spin_post)
+        form.addRow("事件中心後保留秒數：", self.spin_post)
 
         self.spin_detect_width = QSpinBox()
         self.spin_detect_width.setRange(320, 8192)
@@ -196,7 +221,7 @@ class ParamsDialog(QDialog):
         self.spin_detect_stride.setValue(int(detect_every_n_frames))
         form.addRow("每幾幀偵測一次：", self.spin_detect_stride)
 
-        tip = QLabel("建議：縮圖寬度 960 或 1280；每 2 幀或 3 幀偵測一次，可大幅加速。\n事件片段仍輸出原始影片，不會縮小。")
+        tip = QLabel("建議：縮圖寬度 960 或 1280；每 2 幀或 3 幀偵測一次，可大幅加速。\n事件片段以事件時間點為中心，仍輸出原始影片且不會縮小。")
         tip.setWordWrap(True)
         layout.addWidget(tip)
 
@@ -452,6 +477,7 @@ class BatchWorker(QObject):
     status_changed = Signal(str)
     video_progress = Signal(int, int)
     frame_progress = Signal(int, int)
+    debug_frame_ready = Signal(object)
     finished = Signal(dict)
     failed = Signal(str, str)
 
@@ -492,6 +518,8 @@ class BatchWorker(QObject):
                 lpr_pipeline=self.config.get("lpr_pipeline"),
                 touch_polygon=self.config.get("touch_polygon"),
                 export_long_stay_screenshots=self.config.get("export_long_stay_screenshots", True),
+                debug_stream_preview=self.config.get("debug_stream_preview", False),
+                debug_frame_cb=self.debug_frame_ready.emit,
                 progress_cb=lambda frame_idx, total_frames: self.frame_progress.emit(frame_idx, total_frames),
                 status_cb=self.status_changed.emit,
                 stop_checker=lambda: self.stop_requested,
@@ -508,11 +536,14 @@ class BatchWorker(QObject):
                     "output_path": item["output_path"],
                     "status": item["status"],
                     "camera_id": item.get("camera_id", ""),
+                    "stream_id": item.get("stream_id", ""),
                     "track_id": item.get("track_id", ""),
                     "track_start_datetime": item.get("track_start_datetime", ""),
                     "track_end_datetime": item.get("track_end_datetime", ""),
                     "track_start_source": item.get("track_start_source", ""),
                     "track_end_source": item.get("track_end_source", ""),
+                    "track_seen_frames": item.get("track_seen_frames", ""),
+                    "track_duration_sec": item.get("track_duration_sec", ""),
                     "plate_text": item.get("plate_text", ""),
                     "plate_raw_text": item.get("plate_raw_text", ""),
                     "plate_confidence": item.get("plate_confidence", ""),
@@ -581,6 +612,8 @@ class MainWindow(QMainWindow):
         self.video_exts = (".mp4", ".avi", ".mov", ".m4v", ".mkv", ".ts", ".264", ".265")
         self.worker_thread = None
         self.worker = None
+        self.debug_preview_dialog = None
+        self.debug_preview_user_closed = False
 
         self.build_ui()
         self.refresh_source_list()
@@ -735,6 +768,10 @@ class MainWindow(QMainWindow):
         self.chk_lpr.setChecked(self.lpr_enabled)
         option_row.addWidget(self.chk_lpr)
 
+        self.chk_debug_stream = QCheckBox("Debug track 預覽")
+        self.chk_debug_stream.setChecked(False)
+        option_row.addWidget(self.chk_debug_stream)
+
         option_row.addWidget(QLabel("OCR："))
         self.cmb_lpr_ocr = QComboBox()
         for label, value in LPR_OCR_CHOICES:
@@ -783,7 +820,7 @@ class MainWindow(QMainWindow):
             "來源選擇：可設為單一資料夾、累加多個資料夾、設為單一影片，或一次設為多個影片；也可在清單中多選後移除。\n"
             "Polygon ROI 操作：左鍵加點、右鍵刪點、清空、確認。\n"
             "邏輯說明：偵測區控制事件起訖；啟用車牌辨識時，會對偵測區內的所有車輛執行 LPR，不依賴觸碰區或連續追蹤。\n"
-            "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段仍輸出原始影片。"
+            "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段以事件時間點為中心輸出原始影片。"
             "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可在 PaddleOCR 或 SVTR / ONNX 二選一。"
         )
         layout.addWidget(help_text)
@@ -1098,6 +1135,7 @@ class MainWindow(QMainWindow):
             self.btn_clear_input,
             self.lst_sources,
             self.chk_lpr,
+            self.chk_debug_stream,
             self.cmb_lpr_ocr,
             self.chk_long_stay_screenshots,
             self.btn_start,
@@ -1258,6 +1296,7 @@ class MainWindow(QMainWindow):
             self.device = selected_device
             self.lbl_device.setText(f"AI裝置：{selected_device} | {selected_device_label}")
             self.detector = ObjectDetector(self.model_path, conf=self.confidence, detect_width=self.detect_width, device=self.device)
+            self.set_status(f"車輛 YOLO tracker：{self.detector.tracker_path}")
             self.lpr_pipeline = None
             if self.chk_lpr.isChecked():
                 self.lpr_ocr_engine = self.cmb_lpr_ocr.currentData() or "paddleocr"
@@ -1282,6 +1321,7 @@ class MainWindow(QMainWindow):
             return
 
         self.set_controls_enabled(False)
+        self.debug_preview_user_closed = False
         self.progress_bar.setValue(0)
         self.lbl_progress.setText("進度：0/0")
         self.lbl_frame_progress.setText("目前影片進度：0/0")
@@ -1305,6 +1345,7 @@ class MainWindow(QMainWindow):
             "export_clips": self.chk_export_clips.isChecked(),
             "detect_every_n_frames": self.detect_every_n_frames,
             "lpr_pipeline": self.lpr_pipeline,
+            "debug_stream_preview": self.chk_debug_stream.isChecked(),
         }
 
         self.worker_thread = QThread(self)
@@ -1315,6 +1356,7 @@ class MainWindow(QMainWindow):
         self.worker.status_changed.connect(self.set_status)
         self.worker.video_progress.connect(self.on_worker_video_progress)
         self.worker.frame_progress.connect(self.on_worker_frame_progress)
+        self.worker.debug_frame_ready.connect(self.on_worker_debug_frame)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.failed.connect(self.on_worker_failed)
         self.worker.finished.connect(self.worker_thread.quit)
@@ -1334,6 +1376,20 @@ class MainWindow(QMainWindow):
             self.lbl_frame_progress.setText(f"目前影片進度：{current}/{total}")
         else:
             self.lbl_frame_progress.setText(f"目前影片進度：已處理 {current} 幀（總幀數未知）")
+
+    def on_worker_debug_frame(self, frame_bgr):
+        if self.debug_preview_user_closed:
+            return
+        if self.debug_preview_dialog is None:
+            self.debug_preview_dialog = DebugStreamPreviewDialog(self)
+            self.debug_preview_dialog.finished.connect(self.on_debug_preview_closed)
+        if not self.debug_preview_dialog.isVisible():
+            self.debug_preview_dialog.show()
+        self.debug_preview_dialog.update_frame(frame_bgr)
+
+    def on_debug_preview_closed(self):
+        self.debug_preview_user_closed = True
+        self.debug_preview_dialog = None
 
     def on_worker_failed(self, title, message):
         self.set_controls_enabled(True)
@@ -1361,6 +1417,7 @@ class MainWindow(QMainWindow):
             f"Run Time: {result['run_time']}\n"
             f"Search Root: {self.input_dir}\n"
             f"Model Path: {self.model_path}\n"
+            f"Tracker Path: {getattr(self.detector, 'tracker_path', '') if self.detector else ''}\n"
             f"AI Device: {self.device}\n"
             f"AI Device Name: {self.device_info['name']}\n"
             f"Excluded Output Root: {self.excluded_dir}\n"
@@ -1379,6 +1436,7 @@ class MainWindow(QMainWindow):
             f"Long Stay Screenshots: {self.chk_long_stay_screenshots.isChecked()}\n"
             f"Export Clips: {self.chk_export_clips.isChecked()}\n"
             f"Draw ROI on Screenshot: {self.chk_draw_roi.isChecked()}\n"
+            f"Debug Stream Preview: {self.chk_debug_stream.isChecked()}\n"
             f"LPR Enabled: {self.chk_lpr.isChecked()}\n"
             f"LPR Plate Model Path: {self.lpr_plate_model_path if self.chk_lpr.isChecked() else ''}\n"
             f"LPR OCR Engine: {self.cmb_lpr_ocr.currentData() if self.chk_lpr.isChecked() else ''}\n"

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable, Iterator
 
+CONTINUOUS_STREAM_GAP_SEC = 2.0
+
 
 _DATE_TIME_PATTERN = re.compile(
     r"(?P<prefix>.*?)(?P<date>20\d{6})\s*[_\-\u2013\u2014]\s*(?P<time>\d{6})",
@@ -32,14 +34,27 @@ class VideoSegment:
 
 
 @dataclass(frozen=True)
+class VideoStream:
+    """A chronological, gap-free stream for one camera."""
+
+    camera_id: str
+    stream_id: str
+    segments: tuple[VideoSegment, ...]
+    start_datetime: datetime | None = None
+    end_datetime: datetime | None = None
+
+
+@dataclass(frozen=True)
 class StreamFrame:
     """Frame yielded from a stitched camera stream with both local and stream timing."""
 
     frame: object
+    stream: VideoStream
     segment: VideoSegment
     local_frame_idx: int
     stream_frame_idx: int
     source_time_sec: float
+    stream_time_sec: float
     absolute_datetime: datetime | None
 
 
@@ -154,14 +169,24 @@ def build_video_segments(
 
 
 class VideoStreamServer:
-    """Groups video files by camera and yields frames as continuous camera streams."""
+    """Groups video files by camera and yields gap-free chronological streams."""
 
-    def __init__(self, segments: Iterable[VideoSegment]):
+    def __init__(self, segments: Iterable[VideoSegment], max_gap_sec: float = CONTINUOUS_STREAM_GAP_SEC):
         self.segments = list(segments)
+        self.max_gap_sec = float(max_gap_sec)
 
     @classmethod
-    def from_paths(cls, video_paths: Iterable[str], input_dir: str | None = None, load_metadata: bool = True):
-        return cls(build_video_segments(video_paths, input_dir=input_dir, load_metadata=load_metadata))
+    def from_paths(
+        cls,
+        video_paths: Iterable[str],
+        input_dir: str | None = None,
+        load_metadata: bool = True,
+        max_gap_sec: float = CONTINUOUS_STREAM_GAP_SEC,
+    ):
+        return cls(
+            build_video_segments(video_paths, input_dir=input_dir, load_metadata=load_metadata),
+            max_gap_sec=max_gap_sec,
+        )
 
     @property
     def total_frames(self) -> int:
@@ -185,12 +210,33 @@ class VideoStreamServer:
         if current_camera is not None:
             yield current_camera, current_segments
 
-    def frames_for_camera(self, camera_id: str, segments: Iterable[VideoSegment]) -> Iterator[StreamFrame]:
+    def iter_streams(self) -> Iterator[VideoStream]:
+        """Yield one stream per camera timeline chunk separated by time gaps."""
+        for camera_id, segments in self.iter_camera_segments():
+            current_segments = []
+            stream_index = 1
+            previous_segment = None
+            for segment in segments:
+                gap_sec = _segment_gap_sec(previous_segment, segment)
+                should_split = current_segments and (
+                    gap_sec is None or gap_sec > self.max_gap_sec
+                )
+                if should_split:
+                    yield _make_video_stream(camera_id, stream_index, current_segments)
+                    stream_index += 1
+                    current_segments = []
+                current_segments.append(segment)
+                previous_segment = segment
+            if current_segments:
+                yield _make_video_stream(camera_id, stream_index, current_segments)
+
+    def frames_for_stream(self, stream: VideoStream) -> Iterator[StreamFrame]:
         import cv2
 
-        # stream_frame_idx resets per camera; local_frame_idx resets for each segment.
+        # stream_frame_idx resets per continuous stream; local_frame_idx resets per file.
         stream_frame_idx = 0
-        for segment in segments:
+        stream_elapsed_sec = 0.0
+        for segment in stream.segments:
             cap = cv2.VideoCapture(segment.path)
             if not cap.isOpened():
                 continue
@@ -204,16 +250,56 @@ class VideoStreamServer:
                     local_frame_idx += 1
                     stream_frame_idx += 1
                     source_time_sec = local_frame_idx / fps
+                    stream_time_sec = stream_elapsed_sec + source_time_sec
                     absolute_datetime = None
                     if segment.start_datetime is not None:
                         absolute_datetime = segment.start_datetime + timedelta(seconds=source_time_sec)
                     yield StreamFrame(
                         frame=frame,
+                        stream=stream,
                         segment=segment,
                         local_frame_idx=local_frame_idx,
                         stream_frame_idx=stream_frame_idx,
                         source_time_sec=source_time_sec,
+                        stream_time_sec=stream_time_sec,
                         absolute_datetime=absolute_datetime,
                     )
             finally:
                 cap.release()
+            stream_elapsed_sec += _segment_duration_sec(segment)
+
+    def frames_for_camera(self, camera_id: str, segments: Iterable[VideoSegment]) -> Iterator[StreamFrame]:
+        """Compatibility wrapper; prefer iter_streams() + frames_for_stream()."""
+        stream = _make_video_stream(camera_id, 1, list(segments))
+        yield from self.frames_for_stream(stream)
+
+
+def _segment_gap_sec(previous_segment, current_segment):
+    if (
+        previous_segment is None
+        or previous_segment.end_datetime is None
+        or current_segment.start_datetime is None
+    ):
+        return None
+    return (current_segment.start_datetime - previous_segment.end_datetime).total_seconds()
+
+
+def _segment_duration_sec(segment: VideoSegment) -> float:
+    if segment.fps > 0 and segment.frame_count > 0:
+        return segment.frame_count / segment.fps
+    if segment.start_datetime is not None and segment.end_datetime is not None:
+        return max(0.0, (segment.end_datetime - segment.start_datetime).total_seconds())
+    return 0.0
+
+
+def _make_video_stream(camera_id: str, stream_index: int, segments: list[VideoSegment]) -> VideoStream:
+    start = next((segment.start_datetime for segment in segments if segment.start_datetime is not None), None)
+    end = next((segment.end_datetime for segment in reversed(segments) if segment.end_datetime is not None), None)
+    stream_id = f"{camera_id}-S{stream_index:03d}"
+    return VideoStream(
+        camera_id=camera_id,
+        stream_id=stream_id,
+        segments=tuple(segments),
+        start_datetime=start,
+        end_datetime=end,
+    )

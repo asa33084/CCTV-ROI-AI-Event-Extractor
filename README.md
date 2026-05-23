@@ -11,6 +11,7 @@
 - 啟用車牌辨識時，會辨識偵測區內的所有車輛，不依賴觸碰區或連續追蹤
 - 影片讀取器會依 CCTV 檔名解析時間序，並讓不同鏡頭各自維持 YOLO track
 - Stream 流程會將車牌辨識結果綁定 vehicle `track_id`，紀錄 track 進入與離開時間
+- 可在 GUI 勾選 Debug track 預覽，顯示 StreamServer 串流畫面與即時 YOLO track id
 - 可輸出事件截圖、事件片段、CSV 日誌與文字摘要報表
 - 長時間停留補抓截圖可在 GUI 中獨立開關
 - 可輸出蒐證 Excel，欄位為 `編號`、`進入日期`、`出去日期`、`車號`、`車輛截圖`
@@ -27,13 +28,17 @@
 |- cctv_roi_ai_event_extractor/
 |  |- __init__.py
 |  |- __main__.py
+|  |- compute.py
 |  |- config.py
 |  |- core.py
 |  |- event_processing.py
 |  |- evidence_report.py
 |  |- gui.py
+|  |- legacy_app.py
 |  |- lpr.py
 |  |- video_stream.py
+|  |- vision_utils.py
+|  |- yolo_detector.py
 |  `- qt_app.py
 |- .env.example
 |- cctv_roi_ai_event_extractor_legacy_backend.py
@@ -46,12 +51,16 @@
 說明：
 
 - `cctv_roi_ai_event_extractor/core.py`：核心 API 對外入口
+- `cctv_roi_ai_event_extractor/compute.py`：CPU / CUDA 裝置偵測與選項列舉
 - `cctv_roi_ai_event_extractor/config.py`：環境變數與執行設定
-- `cctv_roi_ai_event_extractor/event_processing.py`：偵測、ROI、截圖、片段輸出等處理流程
+- `cctv_roi_ai_event_extractor/event_processing.py`：影片處理流程、stream track registry、截圖與片段輸出
 - `cctv_roi_ai_event_extractor/evidence_report.py`：蒐證 Excel 輸出與截圖嵌入
 - `cctv_roi_ai_event_extractor/gui.py`：Qt GUI
+- `cctv_roi_ai_event_extractor/legacy_app.py`：舊 Tk GUI backend
 - `cctv_roi_ai_event_extractor/lpr.py`：車牌偵測、校正、OCR 介面、臺灣格式校正
 - `cctv_roi_ai_event_extractor/video_stream.py`：CCTV 檔名時間解析、鏡頭分組、依時間序輸出影格
+- `cctv_roi_ai_event_extractor/vision_utils.py`：ROI、bbox、繪圖、簡易 IOU tracker 等視覺工具
+- `cctv_roi_ai_event_extractor/yolo_detector.py`：Ultralytics YOLO detect / track adapter
 - `cctv_roi_ai_event_extractor/qt_app.py`：舊 package 入口相容檔
 - `cctv_roi_ai_event_extractor_qt.py`：相容啟動檔
 - `cctv_roi_ai_event_extractor_v4_new.py`：相容 re-export 檔
@@ -199,6 +208,18 @@ $env:YOLO_CONFIG_DIR="C:\cctv-roi-runtime\.runtime\ultralytics"
 
 若未指定 `YOLO_CONFIG_DIR`，程式會自動使用專案內 `.runtime\ultralytics`，避免 Ultralytics 嘗試寫入受限的使用者設定目錄。
 
+速度相關設定：
+
+```powershell
+$env:CCTV_ROI_YOLO_HALF="auto"      # auto 會在 CUDA 裝置上使用 FP16
+$env:CCTV_ROI_YOLO_FUSE="true"      # 載入模型後嘗試 fuse Conv/BN
+$env:CCTV_ROI_YOLO_IMGSZ="640"      # 留空使用 Ultralytics 預設；調低可加速但可能降低小物件準確度
+$env:CCTV_ROI_TORCH_THREADS="8"     # CPU 推論或前後處理用；留空交給 PyTorch
+$env:CCTV_ROI_OPENCV_THREADS="8"    # 影片解碼/縮圖用；留空交給 OpenCV
+```
+
+GUI 的「每幾幀偵測一次」在 stream track 流程會同時控制 YOLO track 頻率；數值越大越快，但 track 起訖時間與短暫出現車輛會更粗略。
+
 車牌辨識可用設定：
 
 ```powershell
@@ -303,7 +324,7 @@ roi_config_polygon.json
 
 若設定 `CCTV_ROI_CONFIG_PATH`，ROI 設定會改存到指定檔案。
 
-截圖、事件片段、CSV 與報表都會輸出在 GUI 選擇的輸出資料夾底下。若來源影片不在目前來源根目錄下，輸出時會使用影片檔名，避免相對路徑逃出輸出資料夾。
+截圖、事件片段、CSV 與報表都會輸出在 GUI 選擇的輸出資料夾底下。事件片段會以事件時間點為中心，依「事件中心前保留秒數」與「事件中心後保留秒數」輸出。若來源影片不在目前來源根目錄下，輸出時會使用影片檔名，避免相對路徑逃出輸出資料夾。
 
 ## 主要依賴說明
 

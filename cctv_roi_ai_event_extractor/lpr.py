@@ -439,6 +439,38 @@ def ctc_decode(logits, charset: list[str], blank_index: int = 0) -> tuple[str, f
     return "".join(chars), float(np.mean(kept_confidences))
 
 
+def index_sequence_decode(indexes, confidences, charset: list[str], blank_index: int = 0) -> tuple[str, float]:
+    """Decode ONNX models that already output class indexes and per-position confidence."""
+    import numpy as np
+
+    idx_arr = np.asarray(indexes)
+    conf_arr = np.asarray(confidences)
+    if idx_arr.ndim >= 2:
+        idx_arr = idx_arr[0]
+    if conf_arr.ndim >= 2:
+        conf_arr = conf_arr[0]
+
+    chars = []
+    kept_confidences = []
+    prev_idx = None
+    for raw_idx, raw_conf in zip(idx_arr.tolist(), conf_arr.tolist()):
+        idx = int(raw_idx)
+        if idx == blank_index:
+            prev_idx = idx
+            continue
+        if idx == prev_idx:
+            continue
+        char_idx = idx if blank_index != 0 else idx - 1
+        if 0 <= char_idx < len(charset):
+            chars.append(charset[char_idx])
+            kept_confidences.append(float(raw_conf))
+        prev_idx = idx
+
+    if not chars:
+        return "", 0.0
+    return "".join(chars), float(np.mean(kept_confidences))
+
+
 class SvtrOcrEngine(OcrEngine):
     """ONNX SVTR/Transformer OCR engine for plate text recognition."""
 
@@ -485,8 +517,12 @@ class SvtrOcrEngine(OcrEngine):
         return np.expand_dims(tensor, axis=0)
 
     def recognize(self, image_bgr) -> tuple[str, float]:
+        import numpy as np
+
         tensor = self._preprocess(image_bgr)
         outputs = self.session.run(None, {self.input_name: tensor})
+        if len(outputs) >= 2 and np.asarray(outputs[0]).dtype.kind in {"i", "u"}:
+            return index_sequence_decode(outputs[0], outputs[1], self.charset, blank_index=self.blank_index)
         return ctc_decode(outputs[0], self.charset, blank_index=self.blank_index)
 
 

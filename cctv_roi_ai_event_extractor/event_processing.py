@@ -1,74 +1,47 @@
 import os
-import csv
 import json
 import shutil
-import threading
-import queue
 import urllib.request
 from datetime import datetime
 
 import cv2
 import numpy as np
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-except Exception:
-    DND_FILES = None
-    TkinterDnD = None
-
-from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QDialog,
-    QDialogButtonBox,
-    QFileDialog,
-    QFormLayout,
-    QFrame,
-    QGraphicsPixmapItem,
-    QGraphicsPolygonItem,
-    QGraphicsScene,
-    QGraphicsTextItem,
-    QGraphicsView,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QMessageBox,
-    QPlainTextEdit,
-    QProgressBar,
-    QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QSpinBox,
-    QDoubleSpinBox,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
-from ultralytics import YOLO
-
 from cctv_roi_ai_event_extractor.config import (
     APP_VERSION,
     ensure_runtime_environment,
     load_config,
 )
-from cctv_roi_ai_event_extractor.lpr import draw_plate_recognitions
+from cctv_roi_ai_event_extractor.compute import (
+    describe_available_compute_devices,
+    get_auto_device_info,
+    list_available_compute_devices,
+)
 from cctv_roi_ai_event_extractor.video_stream import VideoStreamServer
+from cctv_roi_ai_event_extractor.vision_utils import (
+    SimpleIouTracker,
+    bbox_area,
+    bbox_intersects_mask,
+    bbox_iou,
+    build_screenshot_frame,
+    crop_bbox_from_frame,
+    draw_anchor_point,
+    draw_detection,
+    draw_polygon_overlay,
+    get_bottom_center,
+    is_vehicle_detection,
+    make_polygon_mask,
+    plate_recognition_quality,
+    plate_recognitions_match,
+    plate_text_distance,
+    plate_texts_similar,
+    point_in_polygon,
+    polygon_bbox,
+    suppress_duplicate_vehicle_tracks,
+)
+from cctv_roi_ai_event_extractor.yolo_detector import ObjectDetector
 
 ensure_runtime_environment()
-
-try:
-    import torch
-except Exception:
-    torch = None
 
 
 LONG_STAY_SCREENSHOT_INTERVAL_SEC = load_config().long_stay_screenshot_interval_sec
@@ -78,9 +51,9 @@ LPR_AGGREGATION_WINDOW_SEC = 20.0
 LPR_DUPLICATE_SUPPRESS_SEC = 20.0
 LPR_LOCATION_SUPPRESS_SEC = 60.0
 LPR_LOCATION_IOU_THRESHOLD = 0.10
-STREAM_TRACK_RESET_GAP_SEC = 2.0
-STREAM_TRACK_FINALIZE_MISSING_SEC = 2.0
 VEHICLE_TRACK_DUPLICATE_IOU_THRESHOLD = 0.35
+STREAM_TRACK_MIN_SEEN_FRAMES = 8
+STREAM_TRACK_MIN_DURATION_SEC = 0.5
 
 
 # ---------------------------
@@ -92,86 +65,6 @@ def get_app_dir() -> str:
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
-
-
-def get_auto_device_info() -> dict:
-    """Prefer NVIDIA CUDA when available, otherwise fall back to CPU."""
-    info = {
-        "device": "cpu",
-        "name": "CPU",
-        "source": "cpu"
-    }
-
-    try:
-        if torch is not None and torch.cuda.is_available():
-            count = torch.cuda.device_count()
-
-            if count > 0:
-                for i in range(count):
-                    name = torch.cuda.get_device_name(i)
-                    if "nvidia" in name.lower():
-                        return {
-                            "device": f"cuda:{i}",
-                            "name": name,
-                            "source": "cuda"
-                        }
-
-                name = torch.cuda.get_device_name(0)
-                return {
-                    "device": "cuda:0",
-                    "name": name,
-                    "source": "cuda"
-                }
-    except Exception as e:
-        info["name"] = f"CPU（CUDA偵測失敗：{e}）"
-
-    return info
-
-
-def list_available_compute_devices():
-    """Return UI-friendly compute device choices."""
-    devices = [{
-        "value": "cpu",
-        "label": "CPU",
-        "name": "CPU",
-        "kind": "cpu",
-    }]
-
-    try:
-        if torch is not None and torch.cuda.is_available():
-            count = torch.cuda.device_count()
-            gpu_names = []
-            for i in range(count):
-                name = torch.cuda.get_device_name(i)
-                gpu_names.append(name)
-                devices.append({
-                    "value": f"cuda:{i}",
-                    "label": f"GPU {i}: {name}",
-                    "name": name,
-                    "kind": "gpu",
-                })
-
-            if count > 1:
-                devices.append({
-                    "value": ",".join(str(i) for i in range(count)),
-                    "label": "Multi-GPU: " + " | ".join(f"{i}:{name}" for i, name in enumerate(gpu_names)),
-                    "name": ", ".join(gpu_names),
-                    "kind": "multi_gpu",
-                })
-    except Exception:
-        pass
-
-    return devices
-
-
-def describe_available_compute_devices():
-    lines = []
-    for item in list_available_compute_devices():
-        if item["kind"] == "cpu":
-            lines.append("cpu | CPU")
-        else:
-            lines.append(f"{item['value']} | {item['label']}")
-    return "\n".join(lines)
 
 
 def resolve_default_model_path(app_dir: str) -> str:
@@ -561,370 +454,8 @@ def find_first_readable_video(video_paths):
 
 
 # ---------------------------
-# AI Detector
+# 截圖與片段輸出
 # ---------------------------
-class ObjectDetector:
-    """YOLO object detector/tracker wrapper for people and vehicle classes."""
-
-    def __init__(self, model_path: str, conf: float = 0.4, detect_width: int = 1280, device: str | None = None):
-        self.model = YOLO(model_path)
-        self.conf = conf
-        self.detect_width = max(320, int(detect_width))
-        self.device = device or get_auto_device_info()["device"]
-        self.target_classes = {
-            "person",
-            "car",
-            "motorcycle",
-            "bus",
-            "truck"
-        }
-
-    def _prepare_detect_frame(self, frame):
-        """Resize large frames for inference and return factors for restoring boxes."""
-        h, w = frame.shape[:2]
-        if w <= self.detect_width:
-            return frame, 1.0, 1.0
-
-        scale = self.detect_width / float(w)
-        new_w = int(round(w * scale))
-        new_h = int(round(h * scale))
-        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        scale_x = w / float(new_w)
-        scale_y = h / float(new_h)
-        return resized, scale_x, scale_y
-
-    def detect(self, frame):
-        detect_frame, scale_x, scale_y = self._prepare_detect_frame(frame)
-        results = self.model(detect_frame, conf=self.conf, verbose=False, device=self.device)
-        detections = []
-
-        for result in results:
-            boxes = result.boxes
-            names = result.names
-            if boxes is None:
-                continue
-
-            for box in boxes:
-                cls_id = int(box.cls[0].item())
-                cls_name = names.get(cls_id, str(cls_id))
-                score = float(box.conf[0].item())
-
-                if cls_name not in self.target_classes:
-                    continue
-
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                x1 = int(round(x1 * scale_x))
-                y1 = int(round(y1 * scale_y))
-                x2 = int(round(x2 * scale_x))
-                y2 = int(round(y2 * scale_y))
-                detections.append({
-                    "class_name": cls_name,
-                    "score": score,
-                    "bbox": (x1, y1, x2, y2)
-                })
-
-        return detections
-
-    def reset_trackers(self):
-        """Reset Ultralytics tracker state between unrelated streams or large time gaps."""
-        predictor = getattr(self.model, "predictor", None)
-        trackers = getattr(predictor, "trackers", None) if predictor is not None else None
-        for tracker in trackers or []:
-            reset = getattr(tracker, "reset", None)
-            if callable(reset):
-                reset()
-
-    def track(self, frame, persist=True):
-        detect_frame, scale_x, scale_y = self._prepare_detect_frame(frame)
-        results = self.model.track(
-            detect_frame,
-            conf=self.conf,
-            verbose=False,
-            device=self.device,
-            persist=bool(persist),
-        )
-        detections = []
-
-        for result in results:
-            boxes = result.boxes
-            names = result.names
-            if boxes is None:
-                continue
-
-            for box in boxes:
-                cls_id = int(box.cls[0].item())
-                cls_name = names.get(cls_id, str(cls_id))
-                score = float(box.conf[0].item())
-
-                if cls_name not in self.target_classes:
-                    continue
-
-                track_id = None
-                if getattr(box, "id", None) is not None:
-                    try:
-                        track_id = int(box.id[0].item())
-                    except Exception:
-                        track_id = None
-                if track_id is None:
-                    continue
-
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                x1 = int(round(x1 * scale_x))
-                y1 = int(round(y1 * scale_y))
-                x2 = int(round(x2 * scale_x))
-                y2 = int(round(y2 * scale_y))
-                detections.append({
-                    "class_name": cls_name,
-                    "score": score,
-                    "bbox": (x1, y1, x2, y2),
-                    "track_id": track_id,
-                })
-
-        return detections
-
-
-# ---------------------------
-# ROI / 繪圖工具
-# ---------------------------
-def get_bottom_center(bbox):
-    """Use the bottom-center point as the ROI anchor for person/vehicle detections."""
-    x1, y1, x2, y2 = bbox
-    x_center = int((x1 + x2) / 2)
-    y_bottom = int(y2)
-    return x_center, y_bottom
-
-
-def point_in_polygon(point, polygon_np):
-    result = cv2.pointPolygonTest(polygon_np, point, False)
-    return result >= 0
-
-
-def bbox_area(bbox):
-    x1, y1, x2, y2 = bbox
-    return max(0, x2 - x1) * max(0, y2 - y1)
-
-
-def bbox_iou(a, b):
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    inter = bbox_area((ix1, iy1, ix2, iy2))
-    if inter <= 0:
-        return 0.0
-    union = bbox_area(a) + bbox_area(b) - inter
-    if union <= 0:
-        return 0.0
-    return inter / float(union)
-
-
-def crop_bbox_from_frame(frame, bbox):
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = bbox
-    x1 = max(0, min(w - 1, int(x1)))
-    y1 = max(0, min(h - 1, int(y1)))
-    x2 = max(0, min(w, int(x2)))
-    y2 = max(0, min(h, int(y2)))
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return frame[y1:y2, x1:x2].copy()
-
-
-def is_vehicle_detection(det):
-    return det.get("class_name") in {"car", "motorcycle", "bus", "truck"}
-
-
-def suppress_duplicate_vehicle_tracks(detections, iou_threshold=VEHICLE_TRACK_DUPLICATE_IOU_THRESHOLD):
-    """Remove overlapping vehicle boxes, keeping the highest-confidence detection."""
-    kept = []
-    for det in sorted(detections, key=lambda item: float(item.get("score", 0.0)), reverse=True):
-        if any(bbox_iou(det["bbox"], existing["bbox"]) >= iou_threshold for existing in kept):
-            continue
-        kept.append(det)
-    return kept
-
-
-def plate_text_distance(a, b):
-    """Small edit-distance helper tuned for plate strings that may differ by one OCR error."""
-    a = a or ""
-    b = b or ""
-    if a == b:
-        return 0
-    if abs(len(a) - len(b)) > 1:
-        return 2
-    if len(a) == len(b):
-        return sum(1 for left, right in zip(a, b) if left != right)
-
-    if len(a) > len(b):
-        a, b = b, a
-    i = 0
-    j = 0
-    edits = 0
-    while i < len(a) and j < len(b):
-        if a[i] == b[j]:
-            i += 1
-            j += 1
-            continue
-        edits += 1
-        if edits > 1:
-            return edits
-        j += 1
-    return edits + (len(b) - j)
-
-
-def plate_texts_similar(a, b):
-    return bool(a and b and plate_text_distance(a, b) <= 1)
-
-
-def plate_recognitions_match(left, right):
-    """Treat recognitions as the same sighting by plate text similarity or box overlap."""
-    if plate_texts_similar(left.text, right.text):
-        return True
-    return bbox_iou(left.bbox, right.bbox) >= LPR_LOCATION_IOU_THRESHOLD
-
-
-def plate_recognition_quality(item):
-    valid_bonus = 1.0 if item.valid_taiwan_format else 0.0
-    return valid_bonus + float(item.confidence or 0.0) + (float(item.detector_score or 0.0) * 0.1)
-
-
-def make_polygon_mask(frame_shape, polygon):
-    """Rasterize a polygon so bbox intersection can be checked cheaply."""
-    h, w = frame_shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    if polygon and len(polygon) >= 3:
-        pts = np.array(polygon, dtype=np.int32)
-        cv2.fillPoly(mask, [pts], 255)
-    return mask
-
-
-def bbox_intersects_mask(bbox, mask):
-    if mask is None:
-        return False
-    h, w = mask.shape[:2]
-    x1, y1, x2, y2 = bbox
-    x1 = max(0, min(w - 1, int(x1)))
-    y1 = max(0, min(h - 1, int(y1)))
-    x2 = max(0, min(w - 1, int(x2)))
-    y2 = max(0, min(h - 1, int(y2)))
-    if x2 < x1 or y2 < y1:
-        return False
-    return bool(np.any(mask[y1:y2 + 1, x1:x2 + 1]))
-
-
-class SimpleIouTracker:
-    """Lightweight fallback tracker that links detections by class and IOU."""
-
-    def __init__(self, iou_threshold=0.25, max_missed=8):
-        self.iou_threshold = float(iou_threshold)
-        self.max_missed = int(max_missed)
-        self.next_id = 1
-        self.tracks = {}
-
-    def update(self, detections):
-        for track in self.tracks.values():
-            track["matched"] = False
-            track["missed"] += 1
-
-        tracked_detections = []
-        for det in detections:
-            best_id = None
-            best_iou = 0.0
-            for track_id, track in self.tracks.items():
-                if track["matched"]:
-                    continue
-                if track["class_name"] != det["class_name"]:
-                    continue
-                score = bbox_iou(track["bbox"], det["bbox"])
-                if score > best_iou:
-                    best_iou = score
-                    best_id = track_id
-
-            if best_id is None or best_iou < self.iou_threshold:
-                best_id = self.next_id
-                self.next_id += 1
-
-            self.tracks[best_id] = {
-                "bbox": det["bbox"],
-                "class_name": det["class_name"],
-                "matched": True,
-                "missed": 0,
-            }
-            det_with_track = dict(det)
-            det_with_track["track_id"] = best_id
-            tracked_detections.append(det_with_track)
-
-        stale_ids = [
-            track_id
-            for track_id, track in self.tracks.items()
-            if track["missed"] > self.max_missed
-        ]
-        for track_id in stale_ids:
-            self.tracks.pop(track_id, None)
-
-        return tracked_detections
-
-
-def draw_detection(frame, det, inside=True):
-    x1, y1, x2, y2 = det["bbox"]
-    color = (0, 255, 0) if inside else (0, 165, 255)
-    label = f'{det["class_name"]} {det["score"]:.2f}'
-    if det.get("track_id") is not None:
-        label += f' #{det["track_id"]}'
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(frame, label, (x1, max(25, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-
-def draw_anchor_point(frame, point, inside):
-    color = (0, 255, 0) if inside else (0, 0, 255)
-    cv2.circle(frame, point, 5, color, -1)
-
-
-def draw_polygon_overlay(frame, polygon, color=(255, 255, 0), fill_color=(0, 255, 255)):
-    out = frame.copy()
-    if len(polygon) >= 3:
-        overlay = out.copy()
-        pts = np.array(polygon, dtype=np.int32)
-        cv2.fillPoly(overlay, [pts], fill_color)
-        out = cv2.addWeighted(overlay, 0.15, out, 0.85, 0)
-        cv2.polylines(out, [pts], True, color, 2)
-    elif len(polygon) >= 2:
-        pts = np.array(polygon, dtype=np.int32)
-        cv2.polylines(out, [pts], False, color, 2)
-    return out
-
-
-def polygon_bbox(polygon):
-    xs = [p[0] for p in polygon]
-    ys = [p[1] for p in polygon]
-    x = min(xs)
-    y = min(ys)
-    w = max(xs) - x
-    h = max(ys) - y
-    return x, y, w, h
-
-
-def build_screenshot_frame(frame, detections, polygon, polygon_np, draw_roi_on_screenshot, plate_recognitions=None, touch_polygon=None):
-    """Create the annotated frame used for saved screenshots."""
-    if not draw_roi_on_screenshot:
-        annotated = frame.copy()
-        return draw_plate_recognitions(annotated, plate_recognitions)
-
-    annotated = draw_polygon_overlay(frame.copy(), polygon)
-    if touch_polygon:
-        annotated = draw_polygon_overlay(annotated, touch_polygon, color=(255, 0, 255), fill_color=(255, 0, 255))
-    for det in detections:
-        anchor = get_bottom_center(det["bbox"])
-        inside = point_in_polygon(anchor, polygon_np)
-        draw_detection(annotated, det, inside=inside)
-        draw_anchor_point(annotated, anchor, inside=inside)
-    draw_plate_recognitions(annotated, plate_recognitions)
-    return annotated
-
-
 def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, frame_idx, current_time_sec,
                         frame, detections, polygon, polygon_np, draw_roi_on_screenshot, lpr_pipeline=None,
                         touch_polygon=None, record_type="screenshot", plate_recognitions_override=None):
@@ -1067,38 +598,36 @@ def export_interval_clip(
     return True, out_path
 
 
+def centered_event_interval(event_time_sec: float, pre_event_sec: float, post_event_sec: float, total_sec: float | None = None):
+    """Return a clip interval centered on the event timestamp."""
+    center = max(0.0, float(event_time_sec or 0.0))
+    start_t = max(0.0, center - max(0.0, float(pre_event_sec or 0.0)))
+    end_t = center + max(0.0, float(post_event_sec or 0.0))
+    if total_sec is not None and total_sec > 0:
+        end_t = min(end_t, total_sec)
+    return center, start_t, max(start_t, end_t)
+
+
 def _format_datetime(value):
     if value is None:
         return ""
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _track_row_key(camera_id, tracker_session_id, track_id):
-    """Build a stable internal key for one tracker id within a camera/session."""
-    return f"{camera_id}:{tracker_session_id}:{track_id}"
+def _track_row_key(camera_id, stream_id, track_id):
+    """Build a stable internal key for one YOLO track inside one continuous stream."""
+    return f"{camera_id}:{stream_id}:{track_id}"
 
 
-def _format_track_id(tracker_session_id, track_id, lifecycle_index=1):
-    """Format user-facing track ids, including tracker resets and reused ids."""
-    base = str(track_id) if tracker_session_id <= 1 else f"{tracker_session_id}-{track_id}"
-    if lifecycle_index <= 1:
-        return base
-    return f"{base}.{lifecycle_index}"
+def _stream_track_duration_sec(record):
+    return max(0.0, float(record.get("end_stream_time_sec", 0.0)) - float(record.get("start_stream_time_sec", 0.0)))
 
 
-def _segment_gap_sec(previous_segment, current_segment):
-    if (
-        previous_segment is None
-        or previous_segment.end_datetime is None
-        or current_segment.start_datetime is None
-    ):
-        return None
-    return (current_segment.start_datetime - previous_segment.end_datetime).total_seconds()
-
-
-def _stream_track_max_missing_frames(segment):
-    fps = float(getattr(segment, "fps", 0.0) or 0.0) or 30.0
-    return max(1, int(round(fps * STREAM_TRACK_FINALIZE_MISSING_SEC)))
+def _is_reportable_stream_track(record):
+    """Suppress one-frame YOLO fragments while keeping real but intermittently detected tracks."""
+    seen_frames = int(record.get("seen_frames", 0) or 0)
+    duration_sec = _stream_track_duration_sec(record)
+    return seen_frames >= STREAM_TRACK_MIN_SEEN_FRAMES or duration_sec >= STREAM_TRACK_MIN_DURATION_SEC
 
 
 def _empty_log_row(record_type, video_rel_path="", status="OK"):
@@ -1111,11 +640,14 @@ def _empty_log_row(record_type, video_rel_path="", status="OK"):
         "output_path": "",
         "status": status,
         "camera_id": "",
+        "stream_id": "",
         "track_id": "",
         "track_start_datetime": "",
         "track_end_datetime": "",
         "track_start_source": "",
         "track_end_source": "",
+        "track_seen_frames": "",
+        "track_duration_sec": "",
         "plate_text": "",
         "plate_raw_text": "",
         "plate_confidence": "",
@@ -1123,6 +655,26 @@ def _empty_log_row(record_type, video_rel_path="", status="OK"):
         "plate_valid_taiwan_format": "",
         "plate_ocr_engine": "",
     }
+
+
+def _build_stream_debug_frame(stream_item, detections, polygon, polygon_np, plate_recognitions=None):
+    debug_frame = build_screenshot_frame(
+        frame=stream_item.frame,
+        detections=detections,
+        polygon=polygon,
+        polygon_np=polygon_np,
+        draw_roi_on_screenshot=True,
+        plate_recognitions=plate_recognitions,
+    )
+    header = (
+        f"camera={stream_item.stream.camera_id} "
+        f"stream={stream_item.stream.stream_id} "
+        f"source={stream_item.segment.rel_path} "
+        f"frame={stream_item.local_frame_idx} "
+        f"time={_format_datetime(stream_item.absolute_datetime)}"
+    )
+    cv2.putText(debug_frame, header, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+    return debug_frame
 
 
 def process_video_stream(
@@ -1143,12 +695,14 @@ def process_video_stream(
     lpr_pipeline=None,
     touch_polygon=None,
     export_long_stay_screenshots: bool = True,
+    debug_stream_preview: bool = False,
+    debug_frame_cb=None,
     progress_cb=None,
     status_cb=None,
     stop_checker=None,
 ):
     """Process multiple video files as per-camera streams and summarize each tracked vehicle."""
-    del start_trigger_frames, end_hold_sec, pre_event_sec, post_event_sec
+    del start_trigger_frames, end_hold_sec
     del touch_polygon, export_long_stay_screenshots
 
     logs = []
@@ -1157,36 +711,45 @@ def process_video_stream(
     processed_frames = 0
     detect_every_n_frames = max(1, int(detect_every_n_frames))
     polygon_np = np.array(polygon, dtype=np.int32)
+    detection_mask = None
 
     stream = VideoStreamServer.from_paths(video_paths, input_dir=input_dir, load_metadata=True)
     total_frames = stream.total_frames
     segments_by_rel_path = {segment.rel_path: segment for segment in stream.segments}
+    debug_preview_closed = False
 
     if status_cb:
         cameras = ", ".join(stream.camera_ids) or "N/A"
-        status_cb(f"[STREAM] 影片讀取器啟動 | cameras={cameras} | videos={len(stream.segments)}")
+        status_cb(
+            f"[STREAM] 影片讀取器啟動 | cameras={cameras} | videos={len(stream.segments)} "
+            f"| track_stride={detect_every_n_frames}"
+        )
+        if getattr(detector, "tracker_path", None):
+            status_cb(f"[TRACKER] {detector.tracker_path}")
         if export_clips:
-            status_cb("[STREAM] 事件片段會以 track start/end 輸出；跨檔 track 先略過片段。")
+            status_cb("[STREAM] 事件片段會以 track 進入時間為中心，依前後保留秒數輸出。")
+        if debug_stream_preview:
+            status_cb("[DEBUG] Stream YOLO track 預覽已啟用；關閉 Qt 預覽視窗可停止顯示。")
 
     skipped_segments = 0
     success_segments = 0
     clip_index = 0
 
-    for camera_id, segments in stream.iter_camera_segments():
+    for video_stream in stream.iter_streams():
+        camera_id = video_stream.camera_id
+        stream_id = video_stream.stream_id
+        segments = list(video_stream.segments)
         detector.reset_trackers()
         records = {}
-        completed_records = []
-        missing_counts = {}
-        active_key_by_raw_key = {}
-        lifecycle_counts = {}
-        first_track_frame = True
-        current_segment = None
-        tracker_session_id = 1
 
         if status_cb:
-            status_cb(f"[STREAM] camera={camera_id} | segments={len(segments)} | track reset")
+            status_cb(
+                f"[STREAM] camera={camera_id} stream={stream_id} | "
+                f"segments={len(segments)} | YOLO track reset"
+            )
 
-        for stream_item in stream.frames_for_camera(camera_id, segments):
+        current_segment = None
+        for stream_item in stream.frames_for_stream(video_stream):
             if stop_checker and stop_checker():
                 if status_cb:
                     status_cb("[STOP] 已停止 stream 處理")
@@ -1206,32 +769,24 @@ def process_video_stream(
                 }
 
             if stream_item.segment != current_segment:
-                # Keep tracker identity across adjacent files, but reset after unknown or large gaps.
-                gap_sec = _segment_gap_sec(current_segment, stream_item.segment)
-                should_reset = current_segment is not None and (
-                    gap_sec is None or gap_sec > STREAM_TRACK_RESET_GAP_SEC
-                )
-                if should_reset:
-                    tracker_session_id += 1
-                    detector.reset_trackers()
-                    first_track_frame = True
                 current_segment = stream_item.segment
                 if status_cb:
-                    if should_reset:
-                        status_cb(
-                            f"[STREAM] camera={camera_id} segment={current_segment.rel_path} | "
-                            f"track reset gap={gap_sec if gap_sec is not None else 'unknown'}s"
-                        )
-                    else:
-                        status_cb(f"[STREAM] camera={camera_id} segment={current_segment.rel_path} | track persist")
+                    status_cb(
+                        f"[STREAM] camera={camera_id} stream={stream_id} "
+                        f"segment={current_segment.rel_path} | track persist"
+                    )
 
             processed_frames += 1
             if progress_cb and processed_frames % 10 == 0:
                 progress_cb(processed_frames, total_frames)
 
-            detections = detector.track(stream_item.frame, persist=not first_track_frame)
-            first_track_frame = False
-            detection_mask = make_polygon_mask(stream_item.frame.shape, polygon)
+            should_track = ((stream_item.stream_frame_idx - 1) % detect_every_n_frames == 0)
+            if not should_track:
+                continue
+
+            detections = detector.track(stream_item.frame, persist=True)
+            if detection_mask is None or detection_mask.shape[:2] != stream_item.frame.shape[:2]:
+                detection_mask = make_polygon_mask(stream_item.frame.shape, polygon)
             # Track summaries are based on vehicles whose box intersects the detection ROI.
             vehicle_detections = suppress_duplicate_vehicle_tracks([
                 det for det in detections
@@ -1241,42 +796,40 @@ def process_video_stream(
                 det for det in vehicle_detections
                 if is_vehicle_detection(det) and bbox_intersects_mask(det["bbox"], detection_mask)
             ]
-            seen_keys = set()
-            should_run_lpr = ((stream_item.stream_frame_idx - 1) % detect_every_n_frames == 0)
+            should_run_lpr = True
+            debug_detections = []
+            debug_plate_recognitions = []
 
             for det in inside_vehicle_detections:
                 track_id = det.get("track_id")
                 if track_id is None:
                     continue
-                raw_key = _track_row_key(camera_id, tracker_session_id, track_id)
-                key = active_key_by_raw_key.get(raw_key)
-                if key is None:
-                    lifecycle_index = lifecycle_counts.get(raw_key, 0) + 1
-                    lifecycle_counts[raw_key] = lifecycle_index
-                    key = f"{raw_key}:{lifecycle_index}"
-                    active_key_by_raw_key[raw_key] = key
-                display_track_id = _format_track_id(
-                    tracker_session_id,
-                    track_id,
-                    lifecycle_counts.get(raw_key, 1),
-                )
-                seen_keys.add(key)
-                missing_counts[key] = 0
+                key = _track_row_key(camera_id, stream_id, track_id)
+                display_track_id = str(track_id)
+                debug_det = dict(det)
+                debug_det["track_id"] = display_track_id
+                debug_detections.append(debug_det)
 
                 record = records.get(key)
                 if record is None:
                     # New track: store timing, source file, best plate, and best screenshot as it evolves.
                     record = {
                         "camera_id": camera_id,
+                        "stream_id": stream_id,
                         "track_id": display_track_id,
                         "raw_track_id": track_id,
-                        "raw_key": raw_key,
+                        "raw_key": key,
                         "start_datetime": stream_item.absolute_datetime,
                         "end_datetime": stream_item.absolute_datetime,
                         "start_source": stream_item.segment.rel_path,
                         "end_source": stream_item.segment.rel_path,
                         "start_time_sec": stream_item.source_time_sec,
                         "end_time_sec": stream_item.source_time_sec,
+                        "start_stream_time_sec": stream_item.stream_time_sec,
+                        "end_stream_time_sec": stream_item.stream_time_sec,
+                        "first_stream_frame_idx": stream_item.stream_frame_idx,
+                        "last_stream_frame_idx": stream_item.stream_frame_idx,
+                        "seen_frames": 0,
                         "video_rel_path": stream_item.segment.rel_path,
                         "best_quality": -1.0,
                         "best_plate": None,
@@ -1287,7 +840,12 @@ def process_video_stream(
                 record["end_datetime"] = stream_item.absolute_datetime
                 record["end_source"] = stream_item.segment.rel_path
                 record["end_time_sec"] = stream_item.source_time_sec
+                record["end_stream_time_sec"] = stream_item.stream_time_sec
+                record["last_stream_frame_idx"] = stream_item.stream_frame_idx
+                record["seen_frames"] = int(record.get("seen_frames", 0) or 0) + 1
                 record["last_bbox"] = det["bbox"]
+                if record.get("best_plate") is not None:
+                    debug_plate_recognitions.append(record["best_plate"])
 
                 if lpr_pipeline is None or not should_run_lpr:
                     continue
@@ -1303,6 +861,7 @@ def process_video_stream(
 
                 record["best_quality"] = quality
                 record["best_plate"] = recognition
+                debug_plate_recognitions.append(recognition)
 
                 if export_screenshots:
                     rel_dir = os.path.dirname(stream_item.segment.rel_path)
@@ -1329,23 +888,41 @@ def process_video_stream(
                         record["best_screenshot_path"] = shot_path
 
                 if status_cb:
-                    status_cb(f"[TRACK-LPR] camera={camera_id} track={display_track_id} plate={recognition.text}")
+                    status_cb(
+                        f"[TRACK-LPR] camera={camera_id} stream={stream_id} "
+                        f"track={display_track_id} plate={recognition.text}"
+                    )
 
-            for key in list(records):
-                if key in seen_keys:
-                    continue
-                missing_counts[key] = missing_counts.get(key, 0) + 1
-                if missing_counts[key] <= _stream_track_max_missing_frames(current_segment):
-                    continue
-                record = records.pop(key)
-                active_key_by_raw_key.pop(record.get("raw_key"), None)
-                missing_counts.pop(key, None)
-                completed_records.append(record)
+            if debug_stream_preview and not debug_preview_closed:
+                try:
+                    debug_frame = _build_stream_debug_frame(
+                        stream_item,
+                        debug_detections,
+                        polygon,
+                        polygon_np,
+                        plate_recognitions=debug_plate_recognitions,
+                    )
+                    if debug_frame_cb is not None:
+                        debug_frame_cb(debug_frame)
+                except Exception as e:
+                    debug_preview_closed = True
+                    if status_cb:
+                        status_cb(f"[DEBUG-SKIP] Stream 預覽無法顯示：{e}")
 
         success_segments += len(segments)
 
-        for record in completed_records + list(records.values()):
+        for record in records.values():
             # Emit exactly one summary row per completed/active track at camera end.
+            if not _is_reportable_stream_track(record):
+                plate = record.get("best_plate")
+                if status_cb and plate is not None:
+                    status_cb(
+                        f"[TRACK-SKIP] camera={record['camera_id']} stream={record['stream_id']} "
+                        f"track={record['track_id']} plate={plate.text} "
+                        f"frames={record.get('seen_frames', 0)} duration={_stream_track_duration_sec(record):.2f}s"
+                    )
+                continue
+
             plate = record.get("best_plate")
             row = _empty_log_row("track_summary", video_rel_path=record.get("video_rel_path", ""))
             row.update({
@@ -1354,11 +931,14 @@ def process_video_stream(
                 "interval_end_sec": f'{record.get("end_time_sec", 0.0):.2f}',
                 "output_path": record.get("best_screenshot_path", ""),
                 "camera_id": record["camera_id"],
+                "stream_id": record["stream_id"],
                 "track_id": str(record["track_id"]),
                 "track_start_datetime": _format_datetime(record.get("start_datetime")),
                 "track_end_datetime": _format_datetime(record.get("end_datetime")),
                 "track_start_source": record.get("start_source", ""),
                 "track_end_source": record.get("end_source", ""),
+                "track_seen_frames": str(record.get("seen_frames", 0)),
+                "track_duration_sec": f"{_stream_track_duration_sec(record):.2f}",
             })
             if plate is not None:
                 row.update({
@@ -1370,22 +950,28 @@ def process_video_stream(
                     "plate_ocr_engine": lpr_pipeline.engine_name if lpr_pipeline is not None else "",
                 })
 
-            if export_clips and record.get("start_source") == record.get("end_source"):
+            if export_clips:
                 segment = segments_by_rel_path.get(record.get("start_source"))
                 if segment is not None:
                     clip_index += 1
                     rel_dir = os.path.dirname(segment.rel_path)
                     clip_out_dir = os.path.join(clips_root, rel_dir)
                     base_name = os.path.splitext(os.path.basename(segment.path))[0]
+                    event_time_sec, clip_start_t, clip_end_t = centered_event_interval(
+                        record.get("start_time_sec", 0.0),
+                        pre_event_sec,
+                        post_event_sec,
+                        (segment.frame_count / segment.fps) if segment.frame_count > 0 and segment.fps > 0 else None,
+                    )
+                    row["event_time_sec"] = f"{event_time_sec:.2f}"
+                    row["interval_start_sec"] = f"{clip_start_t:.2f}"
+                    row["interval_end_sec"] = f"{clip_end_t:.2f}"
                     ok_clip, clip_path = export_interval_clip(
                         video_path=segment.path,
                         clip_out_dir=clip_out_dir,
-                        base_name=f"{base_name}__track{record['track_id']}",
-                        start_t=max(0.0, float(record.get("start_time_sec", 0.0))),
-                        end_t=max(
-                            float(record.get("start_time_sec", 0.0)),
-                            float(record.get("end_time_sec", 0.0)),
-                        ),
+                        base_name=f"{base_name}__{record['stream_id']}__track{record['track_id']}",
+                        start_t=clip_start_t,
+                        end_t=clip_end_t,
                         clip_index=clip_index,
                         status_cb=status_cb,
                     )
@@ -1395,11 +981,6 @@ def process_video_stream(
                             row["output_path"] = clip_path or ""
                 elif status_cb:
                     status_cb(f"[CLIP-SKIP] 找不到 track 來源影片：{record.get('start_source')}")
-            elif export_clips and record.get("start_source") != record.get("end_source") and status_cb:
-                status_cb(
-                    f"[CLIP-SKIP] track #{record['track_id']} 跨檔案，暫不輸出合併片段："
-                    f"{record.get('start_source')} -> {record.get('end_source')}"
-                )
             logs.append(row)
 
     if progress_cb:
@@ -1506,8 +1087,6 @@ def process_video(
             f"Frames={total} | detect_width={detector.detect_width} | stride={detect_every_n_frames}"
         )
 
-    pre_event_frames = max(0, int(round(pre_event_sec * fps)))
-    post_event_frames = max(0, int(round(post_event_sec * fps)))
     end_hold_frames = max(1, int(round(end_hold_sec * fps)))
     start_trigger_frames = max(1, int(start_trigger_frames))
 
@@ -1522,7 +1101,7 @@ def process_video(
     use_touch_lpr = False
 
     in_event = False
-    event_start_frame = None
+    event_center_frame = None
     last_inside_frame = None
     start_counter = 0
 
@@ -1537,6 +1116,18 @@ def process_video(
     lpr_pending_groups = []
     lpr_suppressed_until = {}
     lpr_suppressed_locations = []
+
+    def append_centered_clip_interval():
+        if event_center_frame is None:
+            return
+        total_sec = (total / fps) if total > 0 else None
+        center_t = max(0.0, (event_center_frame - 1) / fps)
+        event_intervals.append(centered_event_interval(
+            center_t,
+            pre_event_sec,
+            post_event_sec,
+            total_sec,
+        ))
 
     def flush_lpr_group(group):
         """Commit the best candidate in a pending LPR group to logs/screenshots."""
@@ -1894,9 +1485,8 @@ def process_video(
                     #   因此需依 detect_every_n_frames 回推真正較合理的事件起點。
                     trigger_frame = frame_idx - ((start_trigger_frames - 1) * detect_every_n_frames)
 
-                    # 再往前保留 pre_event_sec 對應的 frame 數，
-                    # 讓事件片段起點真正往前延伸。
-                    event_start_frame = max(1, trigger_frame - pre_event_frames)
+                    # 事件片段以事件成立時間點為中心，前後依設定秒數擷取。
+                    event_center_frame = max(1, trigger_frame)
 
                     # 事件一成立，以當前偵測幀視為最後一次確認在 ROI 內的幀
                     last_inside_frame = frame_idx
@@ -1978,30 +1568,16 @@ def process_video(
                 if last_inside_frame is not None:
                     frames_since_last_inside = frame_idx - last_inside_frame
                     if frames_since_last_inside >= end_hold_frames:
-                        raw_end_frame = last_inside_frame
-                        event_end_frame = raw_end_frame + post_event_frames
-                        if total > 0:
-                            event_end_frame = min(event_end_frame, total)
-
-                        start_t = max(0.0, (event_start_frame - 1) / fps)
-                        end_t = max(start_t, event_end_frame / fps)
-                        event_intervals.append((start_t, end_t))
+                        append_centered_clip_interval()
 
                         in_event = False
-                        event_start_frame = None
+                        event_center_frame = None
                         last_inside_frame = None
                         start_counter = 0
                         next_long_stay_shot_frame = None
 
-    if in_event and event_start_frame is not None:
-        raw_end_frame = last_inside_frame if last_inside_frame is not None else frame_idx
-        event_end_frame = raw_end_frame + post_event_frames
-        if total > 0:
-            event_end_frame = min(event_end_frame, total)
-
-        start_t = max(0.0, (event_start_frame - 1) / fps)
-        end_t = max(start_t, event_end_frame / fps)
-        event_intervals.append((start_t, end_t))
+    if in_event and event_center_frame is not None:
+        append_centered_clip_interval()
 
     if use_detection_roi_lpr:
         flush_due_lpr_groups(frame_idx / fps if frame_idx > 0 else 0.0, force=True)
@@ -2012,7 +1588,7 @@ def process_video(
         if status_cb:
             status_cb(f"[CLIP] {rel_video_path} 事件 {len(event_intervals)} 個，準備輸出片段")
 
-        for idx, (start_t, end_t) in enumerate(event_intervals, start=1):
+        for idx, (event_time_sec, start_t, end_t) in enumerate(event_intervals, start=1):
             if stop_checker and stop_checker():
                 if status_cb:
                     status_cb(f"[STOP] 片段輸出中止：{rel_video_path}")
@@ -2041,7 +1617,7 @@ def process_video(
                 logs.append({
                     "type": "clip",
                     "video_rel_path": rel_video_path,
-                    "event_time_sec": "",
+                    "event_time_sec": f"{event_time_sec:.2f}",
                     "interval_start_sec": f"{start_t:.2f}",
                     "interval_end_sec": f"{end_t:.2f}",
                     "output_path": clip_path,
@@ -2067,1069 +1643,9 @@ def process_video(
 
 
 # ---------------------------
-# 一次填完全部參數的視窗
+# Legacy Tk launcher
 # ---------------------------
-class ParamsDialog(tk.Toplevel):
-    """Legacy Tk dialog for collecting detection timing and inference parameters."""
-
-    def __init__(
-        self,
-        parent,
-        confidence,
-        start_trigger_frames,
-        end_hold_sec,
-        pre_event_sec,
-        post_event_sec,
-        detect_width,
-        detect_every_n_frames
-    ):
-        super().__init__(parent)
-        self.title("AI 參數設定")
-        self.resizable(False, False)
-        self.result = None
-
-        self.transient(parent)
-        self.grab_set()
-        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
-
-        ttk.Label(self, text="請一次輸入所有 AI 參數：").grid(
-            row=0, column=0, columnspan=2, padx=12, pady=(12, 10), sticky="w"
-        )
-
-        ttk.Label(self, text="YOLO 偵測置信度：").grid(row=1, column=0, padx=12, pady=6, sticky="e")
-        self.ent_conf = ttk.Entry(self, width=18)
-        self.ent_conf.grid(row=1, column=1, padx=12, pady=6, sticky="w")
-        self.ent_conf.insert(0, str(confidence))
-
-        ttk.Label(self, text="事件開始連續幀數：").grid(row=2, column=0, padx=12, pady=6, sticky="e")
-        self.ent_start = ttk.Entry(self, width=18)
-        self.ent_start.grid(row=2, column=1, padx=12, pady=6, sticky="w")
-        self.ent_start.insert(0, str(start_trigger_frames))
-
-        ttk.Label(self, text="事件結束等待秒數：").grid(row=3, column=0, padx=12, pady=6, sticky="e")
-        self.ent_end_hold = ttk.Entry(self, width=18)
-        self.ent_end_hold.grid(row=3, column=1, padx=12, pady=6, sticky="w")
-        self.ent_end_hold.insert(0, str(end_hold_sec))
-
-        ttk.Label(self, text="事件前保留秒數：").grid(row=4, column=0, padx=12, pady=6, sticky="e")
-        self.ent_pre = ttk.Entry(self, width=18)
-        self.ent_pre.grid(row=4, column=1, padx=12, pady=6, sticky="w")
-        self.ent_pre.insert(0, str(pre_event_sec))
-
-        ttk.Label(self, text="事件後保留秒數：").grid(row=5, column=0, padx=12, pady=6, sticky="e")
-        self.ent_post = ttk.Entry(self, width=18)
-        self.ent_post.grid(row=5, column=1, padx=12, pady=6, sticky="w")
-        self.ent_post.insert(0, str(post_event_sec))
-
-        ttk.Label(self, text="偵測前縮圖寬度：").grid(row=6, column=0, padx=12, pady=6, sticky="e")
-        self.ent_detect_width = ttk.Entry(self, width=18)
-        self.ent_detect_width.grid(row=6, column=1, padx=12, pady=6, sticky="w")
-        self.ent_detect_width.insert(0, str(detect_width))
-
-        ttk.Label(self, text="每幾幀偵測一次：").grid(row=7, column=0, padx=12, pady=6, sticky="e")
-        self.ent_detect_stride = ttk.Entry(self, width=18)
-        self.ent_detect_stride.grid(row=7, column=1, padx=12, pady=6, sticky="w")
-        self.ent_detect_stride.insert(0, str(detect_every_n_frames))
-
-        tip = (
-            "建議：縮圖寬度 960 或 1280；每 2 幀或 3 幀偵測一次，可大幅加速。\n"
-            "事件片段仍輸出原始影片，不會縮小。"
-        )
-        ttk.Label(self, text=tip, foreground="#555").grid(
-            row=8, column=0, columnspan=2, padx=12, pady=(4, 8), sticky="w"
-        )
-
-        btns = ttk.Frame(self)
-        btns.grid(row=9, column=0, columnspan=2, pady=(8, 12))
-
-        ttk.Button(btns, text="確定", command=self.on_ok).pack(side="left", padx=6)
-        ttk.Button(btns, text="取消", command=self.on_cancel).pack(side="left", padx=6)
-
-        self.bind("<Return>", lambda e: self.on_ok())
-        self.bind("<Escape>", lambda e: self.on_cancel())
-
-        self.update_idletasks()
-        self.geometry(f"+{parent.winfo_rootx()+80}+{parent.winfo_rooty()+80}")
-
-        self.lift()
-        self.focus_force()
-        self.ent_conf.focus_set()
-
-    def on_ok(self):
-        """Validate user-entered numeric parameters before closing the dialog."""
-        try:
-            conf = float(self.ent_conf.get().strip())
-            start_frames = int(self.ent_start.get().strip())
-            end_hold = float(self.ent_end_hold.get().strip())
-            pre_sec = float(self.ent_pre.get().strip())
-            post_sec = float(self.ent_post.get().strip())
-            detect_width = int(self.ent_detect_width.get().strip())
-            detect_stride = int(self.ent_detect_stride.get().strip())
-
-            if not (0.01 <= conf <= 1.0):
-                raise ValueError("YOLO 偵測置信度需介於 0.01 ~ 1.0")
-            if start_frames < 1:
-                raise ValueError("事件開始連續幀數至少為 1")
-            if end_hold < 0:
-                raise ValueError("事件結束等待秒數不可小於 0")
-            if pre_sec < 0:
-                raise ValueError("事件前保留秒數不可小於 0")
-            if post_sec < 0:
-                raise ValueError("事件後保留秒數不可小於 0")
-            if detect_width < 320:
-                raise ValueError("偵測前縮圖寬度至少需為 320")
-            if detect_stride < 1:
-                raise ValueError("每幾幀偵測一次至少需為 1")
-
-            self.result = {
-                "confidence": conf,
-                "start_trigger_frames": start_frames,
-                "end_hold_sec": end_hold,
-                "pre_event_sec": pre_sec,
-                "post_event_sec": post_sec,
-                "detect_width": detect_width,
-                "detect_every_n_frames": detect_stride
-            }
-            self.destroy()
-        except Exception as e:
-            messagebox.showerror("輸入錯誤", str(e), parent=self)
-
-    def on_cancel(self):
-        self.result = None
-        self.destroy()
-
-
-class PastePathsDialog(tk.Toplevel):
-    """Legacy Tk dialog for pasting multiple source file/folder paths."""
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.parent = parent
-        self.title("貼上多個來源路徑")
-        self.geometry("760x420")
-        self.transient(parent)
-        self.grab_set()
-
-        wrap = ttk.Frame(self, padding=12)
-        wrap.pack(fill="both", expand=True)
-
-        ttk.Label(
-            wrap,
-            text="每行一個路徑，可同時貼資料夾或影片檔。支援從檔案總管複製後直接貼上。",
-            justify="left"
-        ).pack(anchor="w")
-
-        self.txt = tk.Text(wrap, wrap="none", height=16)
-        self.txt.pack(fill="both", expand=True, pady=(8, 0))
-
-        btns = ttk.Frame(wrap)
-        btns.pack(fill="x", pady=(10, 0))
-        ttk.Button(btns, text="貼上並加入", command=self.on_apply).pack(side="left")
-        ttk.Button(btns, text="清空", command=lambda: self.txt.delete("1.0", tk.END)).pack(side="left", padx=(8, 0))
-        ttk.Button(btns, text="取消", command=self.destroy).pack(side="right")
-
-        self.txt.focus_set()
-
-    def on_apply(self):
-        raw = self.txt.get("1.0", tk.END)
-        self.parent.apply_pasted_paths(raw)
-        self.destroy()
-
-
-# ---------------------------
-# GUI App
-# ---------------------------
-class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
-    """Legacy Tk application retained for compatibility with older entry points."""
-
-    def __init__(self):
-        super().__init__()
-        self.title("CCTV ROI AI Event Extractor（Polygon ROI）")
-        self.geometry("1120x700")
-        self.resizable(True, True)
-        print("目前執行的是這支：可縮放版")
-
-        self.app_dir = get_app_dir()
-        self.input_dir = self.app_dir
-        self.selected_input_dirs = []
-        self.selected_video_files = []
-        self.input_mode = "folder"
-        self.dragdrop_available = TkinterDnD is not None and DND_FILES is not None
-
-        self.polygon = None
-        self.total_videos = 0
-        self.done_videos = 0
-        self.stop_flag = False
-
-        self.excluded_dir = None
-        self.screenshots_root = None
-        self.clips_root = None
-        self.logs_root = None
-        self.reports_root = None
-
-        self.model_path = resolve_default_model_path(self.app_dir)
-        self.device_info = get_auto_device_info()
-        self.device = self.device_info["device"]
-        self.detector = None
-
-        self.confidence = 0.4
-        self.start_trigger_frames = 4
-        self.end_hold_sec = 1.5
-        self.pre_event_sec = 10.0
-        self.post_event_sec = 10.0
-        self.detect_width = 1280
-        self.detect_every_n_frames = 2
-
-        self.video_exts = (".mp4", ".avi", ".mov", ".m4v", ".mkv", ".ts", ".264", ".265")
-
-        self.export_screenshots_var = tk.BooleanVar(value=True)
-        self.export_clips_var = tk.BooleanVar(value=True)
-        self.draw_roi_on_screenshot_var = tk.BooleanVar(value=True)
-
-        self.ui_queue = queue.Queue()
-        self.worker_thread = None
-
-        self._build_ui()
-        self.after(80, self._poll_ui_queue)
-
-    def _build_ui(self):
-        """Build the legacy Tk controls and wire button commands."""
-        pad = 12
-        frm = ttk.Frame(self, padding=pad)
-        frm.pack(fill="both", expand=True)
-
-        ttk.Label(
-            frm,
-            text="執行方式：選輸出資料夾（自動排除）→ 掃描影片 → Polygon ROI（可載入舊設定）→ 一次輸入 AI 參數 → 勾選輸出類型 → 批次執行。"
-        ).pack(anchor="w")
-
-        src_wrap = ttk.LabelFrame(frm, text="影片來源", padding=8)
-        src_wrap.pack(fill="x", pady=(8, 0))
-
-        btn_row1 = ttk.Frame(src_wrap)
-        btn_row1.pack(fill="x")
-        self.btn_pick_input = ttk.Button(btn_row1, text="設為單一資料夾", command=self.pick_input_dir)
-        self.btn_pick_input.pack(side="left")
-        self.btn_add_input_dir = ttk.Button(btn_row1, text="加入資料夾", command=self.add_input_dir)
-        self.btn_add_input_dir.pack(side="left", padx=(8, 0))
-        self.btn_paste_dirs = ttk.Button(btn_row1, text="貼上多個資料夾路徑", command=self.open_paste_paths_dialog)
-        self.btn_paste_dirs.pack(side="left", padx=(8, 0))
-        self.btn_pick_file = ttk.Button(btn_row1, text="設為單一影片", command=self.pick_single_file)
-        self.btn_pick_file.pack(side="left", padx=(8, 0))
-        self.btn_pick_files = ttk.Button(btn_row1, text="設為多個影片", command=self.pick_input_files)
-        self.btn_pick_files.pack(side="left", padx=(8, 0))
-
-        btn_row2 = ttk.Frame(src_wrap)
-        btn_row2.pack(fill="x", pady=(8, 0))
-        self.btn_remove_selected_source = ttk.Button(btn_row2, text="移除選取來源", command=self.remove_selected_sources)
-        self.btn_remove_selected_source.pack(side="left")
-        self.btn_clear_input = ttk.Button(btn_row2, text="清空來源", command=self.clear_input_sources)
-        self.btn_clear_input.pack(side="left", padx=(8, 0))
-        drag_text = "可直接拖曳多個資料夾/影片到下方清單" if self.dragdrop_available else "拖曳功能需先安裝 tkinterdnd2：pip install tkinterdnd2"
-        self.lbl_dragdrop = ttk.Label(btn_row2, text=drag_text, foreground="#555")
-        self.lbl_dragdrop.pack(side="left", padx=(12, 0))
-
-        self.lbl_folder = ttk.Label(src_wrap, text=f"影片來源資料夾：{self.input_dir}")
-        self.lbl_folder.pack(anchor="w", pady=(8, 4))
-
-        list_row = ttk.Frame(src_wrap)
-        list_row.pack(fill="x")
-        self.lst_sources = tk.Listbox(list_row, height=5, selectmode=tk.EXTENDED)
-        self.lst_sources.pack(side="left", fill="x", expand=True)
-        yscroll = ttk.Scrollbar(list_row, orient="vertical", command=self.lst_sources.yview)
-        yscroll.pack(side="left", fill="y")
-        self.lst_sources.config(yscrollcommand=yscroll.set)
-        if self.dragdrop_available:
-            try:
-                self.lst_sources.drop_target_register(DND_FILES)
-                self.lst_sources.dnd_bind('<<Drop>>', self.on_drop_sources)
-            except Exception:
-                self.dragdrop_available = False
-                self.lbl_dragdrop.config(text="拖曳功能啟用失敗，仍可用貼上路徑功能", foreground="#a05a00")
-
-        self.lbl_model = ttk.Label(frm, text=f"模型路徑：{self.model_path}")
-        self.lbl_model.pack(anchor="w", pady=(6, 0))
-
-        self.lbl_device = ttk.Label(frm, text=f"AI裝置：自動判斷（目前：{self.device_info['device']} | {self.device_info['name']}）")
-        self.lbl_device.pack(anchor="w", pady=(6, 0))
-
-        self.lbl_excluded = ttk.Label(frm, text="排除資料夾：尚未選擇")
-        self.lbl_excluded.pack(anchor="w", pady=(6, 0))
-
-        self.lbl_out = ttk.Label(frm, text="輸出結構：尚未建立")
-        self.lbl_out.pack(anchor="w", pady=(6, 0))
-
-        self.lbl_found = ttk.Label(frm, text="找到影片數：尚未掃描")
-        self.lbl_found.pack(anchor="w", pady=(6, 0))
-
-        self.lbl_roi = ttk.Label(frm, text="Polygon ROI：尚未選取")
-        self.lbl_roi.pack(anchor="w", pady=(6, 0))
-
-        self.lbl_ai = ttk.Label(
-            frm,
-            text=(
-                f"AI參數：conf={self.confidence} | start_trigger_frames={self.start_trigger_frames} | "
-                f"end_hold_sec={self.end_hold_sec} | pre={self.pre_event_sec} | post={self.post_event_sec} | "
-                f"detect_width={self.detect_width} | stride={self.detect_every_n_frames}"
-            )
-        )
-        self.lbl_ai.pack(anchor="w", pady=(6, 0))
-
-        opts = ttk.Frame(frm)
-        opts.pack(anchor="w", pady=(8, 0))
-
-        ttk.Checkbutton(opts, text="輸出截圖", variable=self.export_screenshots_var).pack(side="left")
-        ttk.Checkbutton(opts, text="輸出事件片段", variable=self.export_clips_var).pack(side="left", padx=(20, 0))
-        ttk.Checkbutton(opts, text="截圖畫出 ROI / 框線", variable=self.draw_roi_on_screenshot_var).pack(side="left", padx=(20, 0))
-
-        btns = ttk.Frame(frm)
-        btns.pack(anchor="w", pady=(10, 0))
-
-        self.btn_start = ttk.Button(btns, text="開始執行", command=self.start_flow)
-        self.btn_start.pack(side="left")
-
-        self.btn_stop = ttk.Button(btns, text="停止", command=self.request_stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=(10, 0))
-
-        self.lbl_progress = ttk.Label(frm, text="進度：0/0")
-        self.lbl_progress.pack(anchor="w", pady=(10, 0))
-
-        self.pbar = ttk.Progressbar(frm, orient="horizontal", mode="determinate")
-        self.pbar.pack(fill="x", pady=(6, 0))
-
-        self.lbl_frame_progress = ttk.Label(frm, text="目前影片進度：0/0")
-        self.lbl_frame_progress.pack(anchor="w", pady=(6, 0))
-
-        self.lbl_status = ttk.Label(frm, text="狀態：待命")
-        self.lbl_status.pack(anchor="w", pady=(10, 0))
-
-        help_text = (
-            "來源選擇：可設為單一資料夾、累加多個資料夾、設為單一影片，或一次設為多個影片；也可在清單中多選後移除。\n"
-            "Polygon ROI 操作：左鍵加點、右鍵刪點、C清空、Enter/Space確認。\n"
-            "邏輯說明：偵測 person / car / motorcycle / bus / truck，只有當目標的底部中心點進入 Polygon ROI，且連續達到門檻幀數，才算事件開始。\n"
-            "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段仍輸出原始影片。\n"
-            "製作人：家宏。"
-        )
-        ttk.Label(frm, text=help_text, foreground="#444", justify="left").pack(anchor="w", pady=(8, 0))
-
-        self._refresh_source_listbox()
-
-    def _post_ui(self, action, **kwargs):
-        """Queue UI work from background threads so Tk updates stay on the main thread."""
-        self.ui_queue.put((action, kwargs))
-
-    def _poll_ui_queue(self):
-        """Apply queued UI updates and reschedule polling."""
-        try:
-            while True:
-                action, kwargs = self.ui_queue.get_nowait()
-                if action == "status":
-                    self.lbl_status.config(text=f"狀態：{kwargs['text']}")
-                elif action == "video_progress":
-                    total = max(1, int(kwargs["total"]))
-                    done = min(int(kwargs["done"]), total)
-                    self.pbar["maximum"] = total
-                    self.pbar["value"] = done
-                    self.lbl_progress.config(text=f"進度：{done}/{total}")
-                elif action == "frame_progress":
-                    if int(kwargs["total"]) > 0:
-                        self.lbl_frame_progress.config(text=f"目前影片進度：{kwargs['current']}/{kwargs['total']}")
-                    else:
-                        self.lbl_frame_progress.config(text=f"目前影片進度：已處理 {kwargs['current']} 幀（總幀數未知）")
-                elif action == "message_info":
-                    messagebox.showinfo(kwargs["title"], kwargs["message"], parent=self)
-                elif action == "message_error":
-                    messagebox.showerror(kwargs["title"], kwargs["message"], parent=self)
-                elif action == "set_buttons":
-                    state = kwargs.get("pick_input_state", kwargs.get("start_state", "normal"))
-                    self.btn_start.config(state=kwargs.get("start_state", "normal"))
-                    self.btn_stop.config(state=kwargs.get("stop_state", "disabled"))
-                    for name in ("btn_pick_input", "btn_add_input_dir", "btn_paste_dirs", "btn_pick_file", "btn_pick_files", "btn_remove_selected_source", "btn_clear_input"):
-                        if hasattr(self, name):
-                            getattr(self, name).config(state=state)
-                    if hasattr(self, "lst_sources"):
-                        self.lst_sources.config(state=state)
-                self.update_idletasks()
-        except queue.Empty:
-            pass
-        self.after(80, self._poll_ui_queue)
-
-    def request_stop(self):
-        self.stop_flag = True
-        self.lbl_status.config(text="狀態：已要求停止（將盡快於影片處理中止）")
-
-    def _refresh_source_listbox(self):
-        if not hasattr(self, "lst_sources"):
-            return
-        self.lst_sources.delete(0, tk.END)
-        items = []
-        if self.input_mode == "files":
-            items = [("file", p) for p in self.selected_video_files]
-        elif self.input_mode == "folders":
-            items = [("folder", p) for p in self.selected_input_dirs]
-        else:
-            items = [("folder", self.input_dir)]
-
-        for kind, path in items:
-            prefix = "[檔案]" if kind == "file" else "[資料夾]"
-            self.lst_sources.insert(tk.END, f"{prefix} {path}")
-
-    def _update_input_label(self):
-        if self.input_mode == "files" and self.selected_video_files:
-            if len(self.selected_video_files) == 1:
-                label = f"影片來源檔案：{self.selected_video_files[0]}"
-            else:
-                label = f"影片來源檔案：共 {len(self.selected_video_files)} 支"
-        elif self.input_mode == "folders" and self.selected_input_dirs:
-            if len(self.selected_input_dirs) == 1:
-                label = f"影片來源資料夾：{self.selected_input_dirs[0]}"
-            else:
-                label = f"影片來源資料夾：共 {len(self.selected_input_dirs)} 個"
-        else:
-            label = f"影片來源資料夾：{self.input_dir}"
-        self.lbl_folder.config(text=label)
-        self._refresh_source_listbox()
-
-    def _split_dnd_items(self, raw: str):
-        """Split tkinterdnd2 drop payloads while preserving paths wrapped in braces."""
-        items = []
-        token = ""
-        in_brace = False
-        for ch in raw:
-            if ch == "{":
-                if not in_brace:
-                    in_brace = True
-                    token = ""
-                else:
-                    token += ch
-            elif ch == "}":
-                if in_brace:
-                    in_brace = False
-                    items.append(token)
-                    token = ""
-                else:
-                    token += ch
-            elif ch.isspace() and not in_brace:
-                if token:
-                    items.append(token)
-                    token = ""
-            else:
-                token += ch
-        if token:
-            items.append(token)
-        return [norm_path(x) for x in items if str(x).strip()]
-
-    def _apply_source_selection(self, folders=None, files=None, append=False):
-        """Apply source selections and keep file/folder modes mutually exclusive."""
-        folders = [norm_path(x) for x in (folders or []) if str(x).strip()]
-        files = [norm_path(x) for x in (files or []) if str(x).strip()]
-        files = [x for x in files if x.lower().endswith(self.video_exts)]
-        folders = [x for x in folders if os.path.isdir(x)]
-
-        if files:
-            if append and self.input_mode == "files":
-                merged = self.selected_video_files + files
-            else:
-                merged = files
-            uniq = []
-            seen = set()
-            for p in merged:
-                if p not in seen:
-                    seen.add(p)
-                    uniq.append(p)
-            self.input_mode = "files"
-            self.selected_video_files = uniq
-            self.selected_input_dirs = []
-            self.input_dir = os.path.dirname(uniq[0]) if uniq else self.input_dir
-            self._update_input_label()
-            return len(uniq), "files"
-
-        if folders:
-            if append:
-                base = []
-                if self.input_mode == "folders":
-                    base = list(self.selected_input_dirs)
-                elif self.input_mode == "folder":
-                    base = [self.input_dir]
-                merged = base + folders
-            else:
-                merged = folders
-            uniq = []
-            seen = set()
-            for p in merged:
-                if p not in seen:
-                    seen.add(p)
-                    uniq.append(p)
-            if len(uniq) == 1 and not append:
-                self.input_mode = "folder"
-                self.input_dir = uniq[0]
-                self.selected_input_dirs = []
-            else:
-                self.input_mode = "folders"
-                self.selected_input_dirs = uniq
-                self.input_dir = uniq[0]
-            self.selected_video_files = []
-            self._update_input_label()
-            return len(uniq), "folders"
-
-        return 0, "none"
-
-    def open_paste_paths_dialog(self):
-        PastePathsDialog(self)
-
-    def apply_pasted_paths(self, raw_text: str):
-        """Parse pasted paths and add any valid supported sources."""
-        lines = []
-        normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
-        for line in normalized.split("\n"):
-            line = line.strip().strip('"').strip("'")
-            if line:
-                lines.append(norm_path(line))
-
-        folders = [p for p in lines if os.path.isdir(p)]
-        files = [p for p in lines if os.path.isfile(p) and p.lower().endswith(self.video_exts)]
-        invalid = [p for p in lines if p not in folders and p not in files]
-
-        count = 0
-        mode = "none"
-        if files:
-            count, mode = self._apply_source_selection(files=files, append=True)
-            self.set_status(f"已加入影片來源，共 {count} 支")
-        if folders:
-            count, mode = self._apply_source_selection(folders=folders, append=True)
-            self.set_status(f"已加入資料夾來源，共 {count} 個")
-        if invalid:
-            messagebox.showwarning("部分路徑無效", "以下路徑不存在或格式不支援：\n\n" + "\n".join(invalid[:20]), parent=self)
-        if not folders and not files:
-            messagebox.showwarning("未加入任何來源", "沒有偵測到有效的資料夾或支援影片檔。", parent=self)
-
-    def on_drop_sources(self, event):
-        """Handle drag-and-drop source additions in the legacy Tk UI."""
-        try:
-            items = self._split_dnd_items(event.data)
-            folders = [p for p in items if os.path.isdir(p)]
-            files = [p for p in items if os.path.isfile(p) and p.lower().endswith(self.video_exts)]
-            invalid = [p for p in items if p not in folders and p not in files]
-
-            if files:
-                count, _ = self._apply_source_selection(files=files, append=True)
-                self.set_status(f"已拖曳加入影片，共 {count} 支")
-            if folders:
-                count, _ = self._apply_source_selection(folders=folders, append=True)
-                self.set_status(f"已拖曳加入資料夾，共 {count} 個")
-            if invalid:
-                messagebox.showwarning("部分拖曳來源未加入", "以下項目不存在或格式不支援：\n\n" + "\n".join(invalid[:20]), parent=self)
-        except Exception as e:
-            messagebox.showerror("拖曳加入失敗", str(e), parent=self)
-
-    def pick_input_dir(self):
-        initialdir = self.selected_input_dirs[0] if self.selected_input_dirs else self.input_dir
-        selected = filedialog.askdirectory(title="設為單一來源資料夾", initialdir=initialdir)
-        if not selected:
-            return
-        self.input_mode = "folder"
-        self.dragdrop_available = TkinterDnD is not None and DND_FILES is not None
-        self.input_dir = norm_path(selected)
-        self.selected_input_dirs = []
-        self.selected_video_files = []
-        self._update_input_label()
-        self.set_status(f"已設為單一資料夾：{self.input_dir}")
-
-    def add_input_dir(self):
-        initialdir = self.selected_input_dirs[-1] if self.selected_input_dirs else self.input_dir
-        selected = filedialog.askdirectory(title="加入來源資料夾", initialdir=initialdir)
-        if not selected:
-            return
-        count, _ = self._apply_source_selection(folders=[selected], append=True)
-        if count:
-            self.set_status(f"已加入來源資料夾，目前共 {count} 個")
-
-    def pick_single_file(self):
-        selected = filedialog.askopenfilename(
-            title="設為單一影片檔",
-            initialdir=self.input_dir,
-            filetypes=[("影片檔", "*.mp4 *.avi *.mov *.m4v *.mkv *.ts *.264 *.265"), ("所有檔案", "*.*")],
-        )
-        if not selected:
-            return
-        count, _ = self._apply_source_selection(files=[selected], append=False)
-        if count:
-            self.set_status("已設為單一影片")
-
-    def pick_input_files(self):
-        selected = filedialog.askopenfilenames(
-            title="設為多個影片檔（可 Ctrl / Shift 多選）",
-            initialdir=self.input_dir,
-            filetypes=[("影片檔", "*.mp4 *.avi *.mov *.m4v *.mkv *.ts *.264 *.265"), ("所有檔案", "*.*")],
-        )
-        if not selected:
-            return
-        count, _ = self._apply_source_selection(files=list(selected), append=False)
-        if count:
-            self.set_status(f"已設為多個影片，共 {count} 支")
-
-    def remove_selected_sources(self):
-        if not hasattr(self, "lst_sources"):
-            return
-        selected_idx = list(self.lst_sources.curselection())
-        if not selected_idx:
-            self.set_status("尚未選取要移除的來源")
-            return
-        if self.input_mode == "files":
-            remain = [p for i, p in enumerate(self.selected_video_files) if i not in selected_idx]
-            self.selected_video_files = remain
-            if remain:
-                self.input_dir = os.path.dirname(remain[0])
-            else:
-                self.input_mode = "folder"
-                self.input_dir = self.app_dir
-        elif self.input_mode == "folders":
-            remain = [p for i, p in enumerate(self.selected_input_dirs) if i not in selected_idx]
-            self.selected_input_dirs = remain
-            if len(remain) == 1:
-                self.input_mode = "folder"
-                self.input_dir = remain[0]
-                self.selected_input_dirs = []
-            elif len(remain) > 1:
-                self.input_mode = "folders"
-                self.input_dir = remain[0]
-            else:
-                self.input_mode = "folder"
-                self.input_dir = self.app_dir
-        else:
-            self.input_dir = self.app_dir
-        self._update_input_label()
-        self.set_status("已移除選取來源")
-
-    def clear_input_sources(self):
-        self.input_mode = "folder"
-        self.input_dir = self.app_dir
-        self.selected_input_dirs = []
-        self.selected_video_files = []
-        self._update_input_label()
-        self.set_status("已清空來源，恢復為程式資料夾")
-
-    def set_status(self, text: str):
-        self.lbl_status.config(text=f"狀態：{text}")
-        self.update_idletasks()
-
-    def _find_videos(self, exclude_dir=None):
-        """Find supported videos from current sources while excluding output folders."""
-        exclude_dir_norm = norm_path(exclude_dir) if exclude_dir else None
-
-        if self.input_mode == "files" and self.selected_video_files:
-            videos = []
-            seen = set()
-            for full_path in self.selected_video_files:
-                full_path = norm_path(full_path)
-                if full_path in seen or not os.path.isfile(full_path):
-                    continue
-                if not full_path.lower().endswith(self.video_exts):
-                    continue
-                if exclude_dir_norm and is_subpath(full_path, exclude_dir_norm):
-                    continue
-                seen.add(full_path)
-                videos.append(full_path)
-            videos.sort()
-            return videos
-
-        if self.input_mode == "folders" and self.selected_input_dirs:
-            folder_list = [norm_path(x) for x in self.selected_input_dirs if os.path.isdir(x)]
-        else:
-            folder_list = [norm_path(self.input_dir)] if os.path.isdir(self.input_dir) else []
-
-        videos = []
-        seen = set()
-        for base_folder in folder_list:
-            for root, dirs, files in os.walk(base_folder):
-                root_norm = norm_path(root)
-                if exclude_dir_norm and is_subpath(root_norm, exclude_dir_norm):
-                    dirs[:] = []
-                    continue
-                if exclude_dir_norm:
-                    kept_dirs = []
-                    for d in dirs:
-                        subdir_full = norm_path(os.path.join(root, d))
-                        if is_subpath(subdir_full, exclude_dir_norm):
-                            continue
-                        kept_dirs.append(d)
-                    dirs[:] = kept_dirs
-                for name in files:
-                    if not name.lower().endswith(self.video_exts):
-                        continue
-                    full_path = norm_path(os.path.join(root, name))
-                    if exclude_dir_norm and is_subpath(full_path, exclude_dir_norm):
-                        continue
-                    if full_path in seen:
-                        continue
-                    seen.add(full_path)
-                    videos.append(full_path)
-        videos.sort()
-        return videos
-
-    def _prepare_output_dirs(self, out_dir):
-        """Create output directories and update labels in the legacy UI."""
-        self.excluded_dir = out_dir
-        self.screenshots_root = os.path.join(out_dir, "screenshots")
-        self.clips_root = os.path.join(out_dir, "motion_clips")
-        self.logs_root = os.path.join(out_dir, "logs")
-        self.reports_root = os.path.join(out_dir, "reports")
-
-        ensure_dir(self.excluded_dir)
-        ensure_dir(self.screenshots_root)
-        ensure_dir(self.clips_root)
-        ensure_dir(self.logs_root)
-        ensure_dir(self.reports_root)
-
-        self.lbl_excluded.config(text=f"排除資料夾：{self.excluded_dir}")
-        self.lbl_out.config(
-            text=(
-                f"輸出結構：{self.screenshots_root} | "
-                f"{self.clips_root} | {self.logs_root} | {self.reports_root}"
-            )
-        )
-
-    def _write_csv_log(self, rows):
-        """Write the legacy UI batch CSV log."""
-        csv_path = os.path.join(self.logs_root, "detection_log.csv")
-        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "run_time",
-                    "video_rel_path",
-                    "record_type",
-                    "event_time_sec",
-                    "interval_start_sec",
-                    "interval_end_sec",
-                    "output_path",
-                    "status",
-                    "camera_id",
-                    "track_id",
-                    "track_start_datetime",
-                    "track_end_datetime",
-                    "track_start_source",
-                    "track_end_source",
-                    "plate_text",
-                    "plate_raw_text",
-                    "plate_confidence",
-                    "plate_bbox",
-                    "plate_valid_taiwan_format",
-                    "plate_ocr_engine",
-                ],
-                extrasaction="ignore",
-            )
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(row)
-        return csv_path
-
-    def _write_summary_report(self, summary_text: str):
-        """Write the legacy UI run summary report."""
-        report_path = os.path.join(self.reports_root, "report_summary.txt")
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(summary_text)
-        return report_path
-
-    def _ask_all_params(self):
-        """Open the parameter dialog and return its validated result."""
-        dlg = ParamsDialog(
-            self,
-            confidence=self.confidence,
-            start_trigger_frames=self.start_trigger_frames,
-            end_hold_sec=self.end_hold_sec,
-            pre_event_sec=self.pre_event_sec,
-            post_event_sec=self.post_event_sec,
-            detect_width=self.detect_width,
-            detect_every_n_frames=self.detect_every_n_frames
-        )
-        self.wait_window(dlg)
-        return dlg.result
-
-    def start_flow(self):
-        """Collect user choices, load model/ROI, and start the legacy worker thread."""
-        if not self.export_screenshots_var.get() and not self.export_clips_var.get():
-            messagebox.showwarning("未選擇輸出類型", "請至少勾選一種輸出類型：截圖或事件片段。", parent=self)
-            return
-
-        if not os.path.exists(self.model_path):
-            messagebox.showerror(
-                "模型不存在",
-                f"找不到模型檔：\n{self.model_path}\n\n請先把 yolo26x.pt 放到 models 資料夾（或程式同層）。",
-                parent=self
-            )
-            return
-
-        out_dir = filedialog.askdirectory(title="選擇輸出資料夾（將自動排除不搜尋）", parent=self)
-        if not out_dir:
-            messagebox.showwarning("取消", "未選擇輸出資料夾，已取消。", parent=self)
-            self.set_status("待命")
-            return
-
-        self._prepare_output_dirs(out_dir)
-
-        self.set_status("掃描影片中...")
-        videos = self._find_videos(exclude_dir=self.excluded_dir)
-        self.lbl_found.config(text=f"找到影片數：{len(videos)} 支")
-
-        if not videos:
-            messagebox.showerror(
-                "找不到影片",
-                f"在以下資料夾及其子資料夾中，找不到支援的影片格式：\n{self.input_dir}\n\n"
-                f"已自動排除輸出資料夾：\n{self.excluded_dir}\n\n"
-                f"支援：{', '.join(self.video_exts)}",
-                parent=self
-            )
-            self.set_status("待命")
-            return
-
-        readable_video = find_first_readable_video(videos)
-        if not readable_video:
-            messagebox.showerror(
-                "無可用影片",
-                "雖然有找到影片檔，但沒有任何一支影片可成功開啟並讀取第一幀。\n請確認影片格式或解碼器是否正常。",
-                parent=self
-            )
-            self.set_status("待命")
-            return
-
-        saved_polygon = load_roi_config(self.app_dir)
-        preset_polygon = None
-        if saved_polygon:
-            use_saved = messagebox.askyesno(
-                "載入既有 Polygon ROI",
-                f"偵測到先前已儲存 Polygon ROI，共 {len(saved_polygon)} 點。\n\n是否沿用並可再調整？",
-                parent=self
-            )
-            if use_saved:
-                preset_polygon = saved_polygon
-
-        first_video_display = safe_relpath(readable_video, self.input_dir)
-        self.set_status(f"Polygon ROI 框選中：{first_video_display}")
-        self.update()
-
-        picker = PolygonROIPicker(readable_video, preset_polygon=preset_polygon)
-        polygon = picker.pick()
-        if not polygon:
-            messagebox.showwarning("取消", "已取消 Polygon ROI 選取。", parent=self)
-            self.set_status("待命")
-            return
-
-        self.polygon = polygon
-        bx, by, bw, bh = polygon_bbox(polygon)
-        self.lbl_roi.config(text=f"Polygon ROI：{len(polygon)} 點 | 外接框 X={bx} Y={by} W={bw} H={bh}")
-        save_roi_config(self.app_dir, polygon)
-
-        self.lift()
-        self.focus_force()
-        self.update_idletasks()
-
-        params = self._ask_all_params()
-        if not params:
-            messagebox.showwarning("取消", "未輸入 AI 參數，已取消。", parent=self)
-            self.set_status("待命")
-            return
-
-        self.confidence = params["confidence"]
-        self.start_trigger_frames = params["start_trigger_frames"]
-        self.end_hold_sec = params["end_hold_sec"]
-        self.pre_event_sec = params["pre_event_sec"]
-        self.post_event_sec = params["post_event_sec"]
-        self.detect_width = params["detect_width"]
-        self.detect_every_n_frames = params["detect_every_n_frames"]
-
-        self.lbl_ai.config(
-            text=(
-                f"AI參數：conf={self.confidence} | start_trigger_frames={self.start_trigger_frames} | "
-                f"end_hold_sec={self.end_hold_sec} | pre={self.pre_event_sec} | post={self.post_event_sec} | "
-                f"detect_width={self.detect_width} | stride={self.detect_every_n_frames}"
-            )
-        )
-
-        try:
-            self.set_status("載入 AI 模型中...")
-            self.device_info = get_auto_device_info()
-            self.device = self.device_info["device"]
-            self.lbl_device.config(
-                text=f"AI裝置：自動判斷（目前：{self.device_info['device']} | {self.device_info['name']}）"
-            )
-            self.detector = ObjectDetector(
-                self.model_path,
-                conf=self.confidence,
-                detect_width=self.detect_width,
-                device=self.device
-            )
-        except Exception as e:
-            messagebox.showerror("模型載入失敗", str(e), parent=self)
-            self.set_status("待命")
-            return
-
-        self.btn_start.config(state="disabled")
-        self.btn_stop.config(state="normal")
-        self.btn_pick_input.config(state="disabled")
-        self.stop_flag = False
-        self.lbl_frame_progress.config(text="目前影片進度：0/0")
-
-        self.worker_thread = threading.Thread(
-            target=self._run_batch,
-            args=(videos,),
-            daemon=True
-        )
-        self.worker_thread.start()
-
-    def _run_batch(self, videos):
-        """Background worker for the legacy UI; posts progress/results through a queue."""
-        run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.total_videos = len(videos)
-        self.done_videos = 0
-
-        self._post_ui("video_progress", done=0, total=self.total_videos)
-
-        total_grabbed = 0
-        total_clips = 0
-        success_count = 0
-        skipped_count = 0
-        stopped_count = 0
-        csv_rows = []
-
-        for i, vp in enumerate(videos, start=1):
-            if self.stop_flag:
-                self._post_ui("status", text="已停止")
-                break
-
-            rel_name = safe_relpath(vp, self.input_dir)
-            self._post_ui("status", text=f"處理中：{rel_name}（{i}/{self.total_videos}）")
-
-            def status_cb(msg):
-                self._post_ui("status", text=msg)
-
-            def progress_cb(frame_idx, total_frames):
-                self._post_ui("frame_progress", current=frame_idx, total=total_frames)
-
-            result = process_video(
-                video_path=vp,
-                rel_video_path=rel_name,
-                screenshots_root=self.screenshots_root,
-                clips_root=self.clips_root,
-                polygon=self.polygon,
-                detector=self.detector,
-                start_trigger_frames=self.start_trigger_frames,
-                end_hold_sec=self.end_hold_sec,
-                pre_event_sec=self.pre_event_sec,
-                post_event_sec=self.post_event_sec,
-                draw_roi_on_screenshot=self.draw_roi_on_screenshot_var.get(),
-                export_screenshots=self.export_screenshots_var.get(),
-                export_clips=self.export_clips_var.get(),
-                detect_every_n_frames=self.detect_every_n_frames,
-                progress_cb=progress_cb,
-                status_cb=status_cb,
-                stop_checker=lambda: self.stop_flag
-            )
-
-            if result["status"] == "OK":
-                success_count += 1
-            elif result["status"] == "STOPPED":
-                stopped_count += 1
-            else:
-                skipped_count += 1
-
-            total_grabbed += result["grabbed_count"]
-            total_clips += result["clip_count"]
-
-            for item in result["logs"]:
-                csv_rows.append({
-                    "run_time": run_time,
-                    "video_rel_path": item["video_rel_path"],
-                    "record_type": item["type"],
-                    "event_time_sec": item["event_time_sec"],
-                    "interval_start_sec": item["interval_start_sec"],
-                    "interval_end_sec": item["interval_end_sec"],
-                    "output_path": item["output_path"],
-                    "status": item["status"],
-                    "camera_id": item.get("camera_id", ""),
-                    "track_id": item.get("track_id", ""),
-                    "track_start_datetime": item.get("track_start_datetime", ""),
-                    "track_end_datetime": item.get("track_end_datetime", ""),
-                    "track_start_source": item.get("track_start_source", ""),
-                    "track_end_source": item.get("track_end_source", ""),
-                    "plate_text": item.get("plate_text", ""),
-                    "plate_raw_text": item.get("plate_raw_text", ""),
-                    "plate_confidence": item.get("plate_confidence", ""),
-                    "plate_bbox": item.get("plate_bbox", ""),
-                    "plate_valid_taiwan_format": item.get("plate_valid_taiwan_format", ""),
-                    "plate_ocr_engine": item.get("plate_ocr_engine", ""),
-                })
-
-            self.done_videos = i
-            self._post_ui("video_progress", done=i, total=self.total_videos)
-
-            if self.stop_flag:
-                self._post_ui("status", text="已停止")
-                break
-
-        csv_path = self._write_csv_log(csv_rows)
-
-        bbox_text = "N/A"
-        if self.polygon:
-            bx, by, bw, bh = polygon_bbox(self.polygon)
-            bbox_text = f"X={bx} Y={by} W={bw} H={bh}"
-
-        summary_text = (
-            f"Tool Name: CCTV ROI AI Event Extractor (Polygon ROI)\n"
-            f"Tool Version: {APP_VERSION}\n"
-            f"Run Time: {run_time}\n"
-            f"Search Root: {self.input_dir}\n"
-            f"Model Path: {self.model_path}\n"
-            f"AI Device: {self.device}\n"
-            f"AI Device Name: {self.device_info['name']}\n"
-            f"Excluded Output Root: {self.excluded_dir}\n"
-            f"Polygon Point Count: {len(self.polygon) if self.polygon else 0}\n"
-            f"Polygon Bounding Box: {bbox_text}\n"
-            f"Confidence: {self.confidence}\n"
-            f"Start Trigger Frames: {self.start_trigger_frames}\n"
-            f"End Hold Sec: {self.end_hold_sec}\n"
-            f"Pre Event Sec: {self.pre_event_sec}\n"
-            f"Post Event Sec: {self.post_event_sec}\n"
-            f"Detect Width: {self.detect_width}\n"
-            f"Detect Every N Frames: {self.detect_every_n_frames}\n"
-            f"Export Screenshots: {self.export_screenshots_var.get()}\n"
-            f"Export Clips: {self.export_clips_var.get()}\n"
-            f"Draw ROI on Screenshot: {self.draw_roi_on_screenshot_var.get()}\n"
-            f"Total Videos Found: {self.total_videos}\n"
-            f"Success Videos: {success_count}\n"
-            f"Skipped Videos: {skipped_count}\n"
-            f"Stopped Videos: {stopped_count}\n"
-            f"Total Screenshots: {total_grabbed}\n"
-            f"Total Event Clips: {total_clips}\n"
-            f"CSV Log Path: {csv_path}\n"
-        )
-        report_path = self._write_summary_report(summary_text)
-
-        self._post_ui("set_buttons", start_state="normal", stop_state="disabled")
-
-        if not self.stop_flag:
-            self._post_ui("status", text=f"完成：共擷取 {total_grabbed} 張，輸出 {total_clips} 支事件片段")
-            self._post_ui(
-                "message_info",
-                title="完成",
-                message=(
-                    f"已完成。\n"
-                    f"找到影片：{self.total_videos} 支\n"
-                    f"成功處理：{success_count} 支\n"
-                    f"略過：{skipped_count} 支\n"
-                    f"共擷取截圖：{total_grabbed} 張\n"
-                    f"共輸出事件片段：{total_clips} 支\n\n"
-                    f"CSV 日誌：\n{csv_path}\n\n"
-                    f"摘要報表：\n{report_path}"
-                )
-            )
-
-
 def main():
-    """Launch the legacy Tk GUI application."""
-    app = App()
-    app.mainloop()
+    from cctv_roi_ai_event_extractor.legacy_app import main as legacy_main
 
-
-if __name__ == "__main__":
-    main()
+    legacy_main()

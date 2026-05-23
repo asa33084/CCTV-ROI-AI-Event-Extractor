@@ -137,9 +137,10 @@ def _dedupe_lpr_rows(rows):
 
 def _track_row_identity(item):
     camera_id = str(item.get("camera_id", ""))
+    stream_id = str(item.get("stream_id", ""))
     track_id = str(item.get("track_id", ""))
-    if camera_id or track_id:
-        return camera_id, track_id
+    if camera_id or stream_id or track_id:
+        return camera_id, stream_id, track_id
     return str(item.get("track_start_source", "")), str(item.get("track_id", ""))
 
 
