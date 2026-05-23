@@ -1,0 +1,18 @@
+tracker_type: botsort
+
+# Detection association thresholds
+track_high_thresh: 0.35
+track_low_thresh: 0.10
+new_track_thresh: 0.60
+track_buffer: 150
+match_thresh: 0.55
+fuse_score: true
+
+# Camera motion compensation
+gmc_method: none
+
+# ReID
+with_reid: true
+proximity_thresh: 0.35
+appearance_thresh: 0.45
+model: auto

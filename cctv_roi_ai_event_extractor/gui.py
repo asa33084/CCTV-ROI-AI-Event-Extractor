@@ -57,6 +57,7 @@ from cctv_roi_ai_event_extractor.core import (
     norm_path,
     polygon_bbox,
     process_video,
+    process_video_stream,
     resolve_default_model_path,
     safe_relpath,
     save_roi_regions,
@@ -72,6 +73,7 @@ LPR_OCR_CHOICES = (
 
 
 def normalize_selectable_lpr_ocr_engine(engine_name: str | None) -> str:
+    """Normalize persisted OCR names to the values offered by the Qt combobox."""
     name = (engine_name or "").strip().lower()
     if name in {"svtr", "transformer"}:
         return "svtr"
@@ -79,6 +81,7 @@ def normalize_selectable_lpr_ocr_engine(engine_name: str | None) -> str:
 
 
 def write_csv_log(logs_root: str, rows):
+    """Write the batch log in UTF-8 with BOM so Excel opens Chinese headers correctly."""
     csv_path = os.path.join(logs_root, "detection_log.csv")
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
@@ -92,6 +95,15 @@ def write_csv_log(logs_root: str, rows):
                 "interval_end_sec",
                 "output_path",
                 "status",
+                "camera_id",
+                "stream_id",
+                "track_id",
+                "track_start_datetime",
+                "track_end_datetime",
+                "track_start_source",
+                "track_end_source",
+                "track_seen_frames",
+                "track_duration_sec",
                 "plate_text",
                 "plate_raw_text",
                 "plate_confidence",
@@ -99,6 +111,7 @@ def write_csv_log(logs_root: str, rows):
                 "plate_valid_taiwan_format",
                 "plate_ocr_engine",
             ],
+            extrasaction="ignore",
         )
         writer.writeheader()
         for row in rows:
@@ -107,6 +120,7 @@ def write_csv_log(logs_root: str, rows):
 
 
 def write_summary_report(reports_root: str, summary_text: str):
+    """Persist the plain-text run summary next to the evidence workbook."""
     report_path = os.path.join(reports_root, "report_summary.txt")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(summary_text)
@@ -114,6 +128,7 @@ def write_summary_report(reports_root: str, summary_text: str):
 
 
 def format_ai_params_text(confidence, start_trigger_frames, end_hold_sec, pre_event_sec, post_event_sec, detect_width, detect_every_n_frames):
+    """Build the compact parameter summary shown in the main window."""
     return (
         f"AI參數：conf={confidence} | start_trigger_frames={start_trigger_frames} | "
         f"end_hold_sec={end_hold_sec} | pre={pre_event_sec} | post={post_event_sec} | "
@@ -122,13 +137,38 @@ def format_ai_params_text(confidence, start_trigger_frames, end_hold_sec, pre_ev
 
 
 def cv_to_qpixmap(frame_bgr):
+    """Convert an OpenCV BGR frame into a detached QPixmap for Qt widgets."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
     image = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(image.copy())
 
 
+class DebugStreamPreviewDialog(QDialog):
+    """Main-thread Qt preview for frames produced by the stream tracking worker."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CCTV Stream YOLO Track Debug")
+        self.resize(960, 540)
+
+        layout = QVBoxLayout(self)
+        self.label = QLabel("等待 debug frame...")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setMinimumSize(640, 360)
+        layout.addWidget(self.label)
+
+    def update_frame(self, frame_bgr):
+        pixmap = cv_to_qpixmap(frame_bgr)
+        target = self.label.size()
+        if target.width() > 0 and target.height() > 0:
+            pixmap = pixmap.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self.label.setPixmap(pixmap)
+
+
 class ParamsDialog(QDialog):
+    """Modal dialog for collecting all detection timing and inference parameters."""
+
     def __init__(self, parent, confidence, start_trigger_frames, end_hold_sec, pre_event_sec, post_event_sec, detect_width, detect_every_n_frames):
         super().__init__(parent)
         self.setWindowTitle("AI 參數設定")
@@ -163,13 +203,13 @@ class ParamsDialog(QDialog):
         self.spin_pre.setRange(0.0, 999999.0)
         self.spin_pre.setDecimals(2)
         self.spin_pre.setValue(float(pre_event_sec))
-        form.addRow("事件前保留秒數：", self.spin_pre)
+        form.addRow("事件中心前保留秒數：", self.spin_pre)
 
         self.spin_post = QDoubleSpinBox()
         self.spin_post.setRange(0.0, 999999.0)
         self.spin_post.setDecimals(2)
         self.spin_post.setValue(float(post_event_sec))
-        form.addRow("事件後保留秒數：", self.spin_post)
+        form.addRow("事件中心後保留秒數：", self.spin_post)
 
         self.spin_detect_width = QSpinBox()
         self.spin_detect_width.setRange(320, 8192)
@@ -181,7 +221,7 @@ class ParamsDialog(QDialog):
         self.spin_detect_stride.setValue(int(detect_every_n_frames))
         form.addRow("每幾幀偵測一次：", self.spin_detect_stride)
 
-        tip = QLabel("建議：縮圖寬度 960 或 1280；每 2 幀或 3 幀偵測一次，可大幅加速。\n事件片段仍輸出原始影片，不會縮小。")
+        tip = QLabel("建議：縮圖寬度 960 或 1280；每 2 幀或 3 幀偵測一次，可大幅加速。\n事件片段以事件時間點為中心，仍輸出原始影片且不會縮小。")
         tip.setWordWrap(True)
         layout.addWidget(tip)
 
@@ -204,6 +244,8 @@ class ParamsDialog(QDialog):
 
 
 class PastePathsDialog(QDialog):
+    """Dialog that lets users paste many source paths at once."""
+
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("貼上多個來源路徑")
@@ -236,6 +278,8 @@ class PastePathsDialog(QDialog):
 
 
 class SourceListWidget(QListWidget):
+    """Source list with drag-and-drop support for files and folders."""
+
     paths_dropped = Signal(list)
 
     def __init__(self, parent=None):
@@ -270,6 +314,8 @@ class SourceListWidget(QListWidget):
 
 
 class PolygonRoiView(QGraphicsView):
+    """Interactive image view for drawing polygon ROI points in original-frame coordinates."""
+
     def __init__(self, frame_bgr, preset_polygon=None, parent=None):
         super().__init__(parent)
         self.frame_bgr = frame_bgr
@@ -326,6 +372,7 @@ class PolygonRoiView(QGraphicsView):
         super().keyPressEvent(event)
 
     def refresh_overlay(self):
+        """Redraw polygon fill, numbered points, and help text after every edit."""
         for item in self.point_items + self.label_items:
             self.scene.removeItem(item)
         self.point_items = []
@@ -364,6 +411,8 @@ class PolygonRoiView(QGraphicsView):
 
 
 class PolygonRoiDialog(QDialog):
+    """Qt wrapper around PolygonRoiView that validates the final ROI."""
+
     def __init__(self, video_path, preset_polygon=None, parent=None, title="Polygon ROI 選取", description=None):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -423,9 +472,12 @@ class PolygonRoiDialog(QDialog):
 
 
 class BatchWorker(QObject):
+    """Runs video processing off the UI thread and reports progress through Qt signals."""
+
     status_changed = Signal(str)
     video_progress = Signal(int, int)
     frame_progress = Signal(int, int)
+    debug_frame_ready = Signal(object)
     finished = Signal(dict)
     failed = Signal(str, str)
 
@@ -439,91 +491,75 @@ class BatchWorker(QObject):
 
     def run(self):
         try:
+            # The worker processes all videos as stitched camera streams, then converts
+            # backend log rows into the stable CSV schema used by the UI.
             run_time = self.config["run_time"]
             videos = self.config["videos"]
             total_videos = len(videos)
-            total_grabbed = 0
-            total_clips = 0
-            success_count = 0
-            skipped_count = 0
-            stopped_count = 0
             csv_rows = []
 
             self.video_progress.emit(0, total_videos)
 
-            for i, vp in enumerate(videos, start=1):
-                if self.stop_requested:
-                    self.status_changed.emit("已停止")
-                    break
+            result = process_video_stream(
+                video_paths=videos,
+                input_dir=self.config["input_dir"],
+                screenshots_root=self.config["screenshots_root"],
+                clips_root=self.config["clips_root"],
+                polygon=self.config["polygon"],
+                detector=self.config["detector"],
+                start_trigger_frames=self.config["start_trigger_frames"],
+                end_hold_sec=self.config["end_hold_sec"],
+                pre_event_sec=self.config["pre_event_sec"],
+                post_event_sec=self.config["post_event_sec"],
+                draw_roi_on_screenshot=self.config["draw_roi_on_screenshot"],
+                export_screenshots=self.config["export_screenshots"],
+                export_clips=self.config["export_clips"],
+                detect_every_n_frames=self.config["detect_every_n_frames"],
+                lpr_pipeline=self.config.get("lpr_pipeline"),
+                touch_polygon=self.config.get("touch_polygon"),
+                export_long_stay_screenshots=self.config.get("export_long_stay_screenshots", True),
+                debug_stream_preview=self.config.get("debug_stream_preview", False),
+                debug_frame_cb=self.debug_frame_ready.emit,
+                progress_cb=lambda frame_idx, total_frames: self.frame_progress.emit(frame_idx, total_frames),
+                status_cb=self.status_changed.emit,
+                stop_checker=lambda: self.stop_requested,
+            )
 
-                rel_name = safe_relpath(vp, self.config["input_dir"])
-                self.status_changed.emit(f"處理中：{rel_name}（{i}/{total_videos}）")
-
-                result = process_video(
-                    video_path=vp,
-                    rel_video_path=rel_name,
-                    screenshots_root=self.config["screenshots_root"],
-                    clips_root=self.config["clips_root"],
-                    polygon=self.config["polygon"],
-                    detector=self.config["detector"],
-                    start_trigger_frames=self.config["start_trigger_frames"],
-                    end_hold_sec=self.config["end_hold_sec"],
-                    pre_event_sec=self.config["pre_event_sec"],
-                    post_event_sec=self.config["post_event_sec"],
-                    draw_roi_on_screenshot=self.config["draw_roi_on_screenshot"],
-                    export_screenshots=self.config["export_screenshots"],
-                    export_clips=self.config["export_clips"],
-                    detect_every_n_frames=self.config["detect_every_n_frames"],
-                    lpr_pipeline=self.config.get("lpr_pipeline"),
-                    touch_polygon=self.config.get("touch_polygon"),
-                    export_long_stay_screenshots=self.config.get("export_long_stay_screenshots", True),
-                    progress_cb=lambda frame_idx, total_frames: self.frame_progress.emit(frame_idx, total_frames),
-                    status_cb=self.status_changed.emit,
-                    stop_checker=lambda: self.stop_requested,
-                )
-
-                if result["status"] == "OK":
-                    success_count += 1
-                elif result["status"] == "STOPPED":
-                    stopped_count += 1
-                else:
-                    skipped_count += 1
-
-                total_grabbed += result["grabbed_count"]
-                total_clips += result["clip_count"]
-
-                for item in result["logs"]:
-                    csv_rows.append({
-                        "run_time": run_time,
-                        "video_rel_path": item["video_rel_path"],
-                        "record_type": item["type"],
-                        "event_time_sec": item["event_time_sec"],
-                        "interval_start_sec": item["interval_start_sec"],
-                        "interval_end_sec": item["interval_end_sec"],
-                        "output_path": item["output_path"],
-                        "status": item["status"],
-                        "plate_text": item.get("plate_text", ""),
-                        "plate_raw_text": item.get("plate_raw_text", ""),
-                        "plate_confidence": item.get("plate_confidence", ""),
-                        "plate_bbox": item.get("plate_bbox", ""),
-                        "plate_valid_taiwan_format": item.get("plate_valid_taiwan_format", ""),
-                        "plate_ocr_engine": item.get("plate_ocr_engine", ""),
-                    })
-
-                self.video_progress.emit(i, total_videos)
-
-                if self.stop_requested:
-                    self.status_changed.emit("已停止")
-                    break
+            for item in result["logs"]:
+                csv_rows.append({
+                    "run_time": run_time,
+                    "video_rel_path": item["video_rel_path"],
+                    "record_type": item["type"],
+                    "event_time_sec": item["event_time_sec"],
+                    "interval_start_sec": item["interval_start_sec"],
+                    "interval_end_sec": item["interval_end_sec"],
+                    "output_path": item["output_path"],
+                    "status": item["status"],
+                    "camera_id": item.get("camera_id", ""),
+                    "stream_id": item.get("stream_id", ""),
+                    "track_id": item.get("track_id", ""),
+                    "track_start_datetime": item.get("track_start_datetime", ""),
+                    "track_end_datetime": item.get("track_end_datetime", ""),
+                    "track_start_source": item.get("track_start_source", ""),
+                    "track_end_source": item.get("track_end_source", ""),
+                    "track_seen_frames": item.get("track_seen_frames", ""),
+                    "track_duration_sec": item.get("track_duration_sec", ""),
+                    "plate_text": item.get("plate_text", ""),
+                    "plate_raw_text": item.get("plate_raw_text", ""),
+                    "plate_confidence": item.get("plate_confidence", ""),
+                    "plate_bbox": item.get("plate_bbox", ""),
+                    "plate_valid_taiwan_format": item.get("plate_valid_taiwan_format", ""),
+                    "plate_ocr_engine": item.get("plate_ocr_engine", ""),
+                })
 
             self.finished.emit({
                 "run_time": run_time,
                 "total_videos": total_videos,
-                "success_count": success_count,
-                "skipped_count": skipped_count,
-                "stopped_count": stopped_count,
-                "total_grabbed": total_grabbed,
-                "total_clips": total_clips,
+                "success_count": result.get("success_count", 0),
+                "skipped_count": result.get("skipped_count", 0),
+                "stopped_count": result.get("stopped_count", 0),
+                "total_grabbed": result["grabbed_count"],
+                "total_clips": result["clip_count"],
                 "csv_rows": csv_rows,
                 "stopped": self.stop_requested,
             })
@@ -532,6 +568,8 @@ class BatchWorker(QObject):
 
 
 class MainWindow(QMainWindow):
+    """Main Qt application window for source selection, ROI setup, and batch execution."""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CCTV ROI AI Event Extractor (Qt)")
@@ -574,6 +612,8 @@ class MainWindow(QMainWindow):
         self.video_exts = (".mp4", ".avi", ".mov", ".m4v", ".mkv", ".ts", ".264", ".265")
         self.worker_thread = None
         self.worker = None
+        self.debug_preview_dialog = None
+        self.debug_preview_user_closed = False
 
         self.build_ui()
         self.refresh_source_list()
@@ -581,6 +621,7 @@ class MainWindow(QMainWindow):
         self.update_ai_label()
 
     def build_ui(self):
+        """Create all widgets and connect button actions."""
         central = QWidget()
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
@@ -727,6 +768,10 @@ class MainWindow(QMainWindow):
         self.chk_lpr.setChecked(self.lpr_enabled)
         option_row.addWidget(self.chk_lpr)
 
+        self.chk_debug_stream = QCheckBox("Debug track 預覽")
+        self.chk_debug_stream.setChecked(False)
+        option_row.addWidget(self.chk_debug_stream)
+
         option_row.addWidget(QLabel("OCR："))
         self.cmb_lpr_ocr = QComboBox()
         for label, value in LPR_OCR_CHOICES:
@@ -775,7 +820,7 @@ class MainWindow(QMainWindow):
             "來源選擇：可設為單一資料夾、累加多個資料夾、設為單一影片，或一次設為多個影片；也可在清單中多選後移除。\n"
             "Polygon ROI 操作：左鍵加點、右鍵刪點、清空、確認。\n"
             "邏輯說明：偵測區控制事件起訖；啟用車牌辨識時，會對偵測區內的所有車輛執行 LPR，不依賴觸碰區或連續追蹤。\n"
-            "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段仍輸出原始影片。"
+            "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段以事件時間點為中心輸出原始影片。"
             "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可在 PaddleOCR 或 SVTR / ONNX 二選一。"
         )
         layout.addWidget(help_text)
@@ -805,6 +850,7 @@ class MainWindow(QMainWindow):
         self.txt_log.appendPlainText(f"[{timestamp}] {text}")
 
     def get_selected_device(self):
+        """Resolve the selected compute device, allowing manual text overrides."""
         manual_value = self.edt_device_override.text().strip()
         if manual_value:
             return manual_value, f"手動指定：{manual_value}"
@@ -820,6 +866,7 @@ class MainWindow(QMainWindow):
         return "cpu", "CPU"
 
     def refresh_source_list(self):
+        """Sync source mode state into the visible list and source label."""
         self.lst_sources.clear()
         if self.input_mode == "files":
             items = [("檔案", p) for p in self.selected_video_files]
@@ -840,6 +887,7 @@ class MainWindow(QMainWindow):
         self.lbl_folder.setText(label)
 
     def apply_source_selection(self, folders=None, files=None, append=False):
+        """Apply file/folder selections while de-duplicating paths and preserving mode."""
         folders = [norm_path(x) for x in (folders or []) if str(x).strip()]
         files = [norm_path(x) for x in (files or []) if str(x).strip()]
         files = [x for x in files if os.path.isfile(x) and x.lower().endswith(self.video_exts)]
@@ -898,6 +946,7 @@ class MainWindow(QMainWindow):
             self.apply_pasted_paths(dialog.get_text())
 
     def apply_pasted_paths(self, raw_text):
+        """Parse pasted lines into valid folders and supported video files."""
         lines = []
         normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
         for line in normalized.split("\n"):
@@ -921,6 +970,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未加入任何來源", "沒有偵測到有效的資料夾或支援影片檔。")
 
     def handle_dropped_paths(self, paths):
+        """Handle normalized paths emitted by SourceListWidget.dropEvent."""
         folders = [p for p in paths if os.path.isdir(p)]
         files = [p for p in paths if os.path.isfile(p) and p.lower().endswith(self.video_exts)]
         invalid = [p for p in paths if p not in folders and p not in files]
@@ -1010,6 +1060,7 @@ class MainWindow(QMainWindow):
         self.set_status("已清空來源，恢復為程式資料夾")
 
     def find_videos(self, exclude_dir=None):
+        """Collect supported videos from the selected source mode, excluding output paths."""
         exclude_dir_norm = norm_path(exclude_dir) if exclude_dir else None
         if self.input_mode == "files" and self.selected_video_files:
             videos = []
@@ -1056,6 +1107,7 @@ class MainWindow(QMainWindow):
         return videos
 
     def prepare_output_dirs(self, out_dir):
+        """Create the output folder structure and remember it for the run."""
         self.excluded_dir = out_dir
         self.screenshots_root = os.path.join(out_dir, "screenshots")
         self.clips_root = os.path.join(out_dir, "motion_clips")
@@ -1072,6 +1124,7 @@ class MainWindow(QMainWindow):
         self.lbl_out.setText(f"輸出結構：{self.screenshots_root} | {self.clips_root} | {self.logs_root} | {self.reports_root}")
 
     def set_controls_enabled(self, enabled):
+        """Disable source and option controls while the background worker is running."""
         for widget in (
             self.btn_pick_input,
             self.btn_add_input_dir,
@@ -1082,6 +1135,7 @@ class MainWindow(QMainWindow):
             self.btn_clear_input,
             self.lst_sources,
             self.chk_lpr,
+            self.chk_debug_stream,
             self.cmb_lpr_ocr,
             self.chk_long_stay_screenshots,
             self.btn_start,
@@ -1110,6 +1164,7 @@ class MainWindow(QMainWindow):
         return None
 
     def start_flow(self):
+        """Validate inputs, collect ROI/params, load models, and start the worker thread."""
         if not self.chk_export_screenshots.isChecked() and not self.chk_export_clips.isChecked():
             QMessageBox.warning(self, "未選擇輸出類型", "請至少勾選一種輸出類型：截圖或事件片段。")
             return
@@ -1241,6 +1296,7 @@ class MainWindow(QMainWindow):
             self.device = selected_device
             self.lbl_device.setText(f"AI裝置：{selected_device} | {selected_device_label}")
             self.detector = ObjectDetector(self.model_path, conf=self.confidence, detect_width=self.detect_width, device=self.device)
+            self.set_status(f"車輛 YOLO tracker：{self.detector.tracker_path}")
             self.lpr_pipeline = None
             if self.chk_lpr.isChecked():
                 self.lpr_ocr_engine = self.cmb_lpr_ocr.currentData() or "paddleocr"
@@ -1265,6 +1321,7 @@ class MainWindow(QMainWindow):
             return
 
         self.set_controls_enabled(False)
+        self.debug_preview_user_closed = False
         self.progress_bar.setValue(0)
         self.lbl_progress.setText("進度：0/0")
         self.lbl_frame_progress.setText("目前影片進度：0/0")
@@ -1288,15 +1345,18 @@ class MainWindow(QMainWindow):
             "export_clips": self.chk_export_clips.isChecked(),
             "detect_every_n_frames": self.detect_every_n_frames,
             "lpr_pipeline": self.lpr_pipeline,
+            "debug_stream_preview": self.chk_debug_stream.isChecked(),
         }
 
         self.worker_thread = QThread(self)
         self.worker = BatchWorker(config)
+        # Keep heavy processing in BatchWorker so the Qt event loop stays responsive.
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.status_changed.connect(self.set_status)
         self.worker.video_progress.connect(self.on_worker_video_progress)
         self.worker.frame_progress.connect(self.on_worker_frame_progress)
+        self.worker.debug_frame_ready.connect(self.on_worker_debug_frame)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.failed.connect(self.on_worker_failed)
         self.worker.finished.connect(self.worker_thread.quit)
@@ -1317,12 +1377,27 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_frame_progress.setText(f"目前影片進度：已處理 {current} 幀（總幀數未知）")
 
+    def on_worker_debug_frame(self, frame_bgr):
+        if self.debug_preview_user_closed:
+            return
+        if self.debug_preview_dialog is None:
+            self.debug_preview_dialog = DebugStreamPreviewDialog(self)
+            self.debug_preview_dialog.finished.connect(self.on_debug_preview_closed)
+        if not self.debug_preview_dialog.isVisible():
+            self.debug_preview_dialog.show()
+        self.debug_preview_dialog.update_frame(frame_bgr)
+
+    def on_debug_preview_closed(self):
+        self.debug_preview_user_closed = True
+        self.debug_preview_dialog = None
+
     def on_worker_failed(self, title, message):
         self.set_controls_enabled(True)
         QMessageBox.critical(self, title, message)
         self.set_status("待命")
 
     def on_worker_finished(self, result):
+        """Write reports, restore UI controls, and show the final completion message."""
         csv_path = write_csv_log(self.logs_root, result["csv_rows"])
         evidence_path = os.path.join(self.reports_root, "evidence_report.xlsx")
         evidence_path, evidence_count = write_evidence_workbook(evidence_path, result["csv_rows"])
@@ -1342,6 +1417,7 @@ class MainWindow(QMainWindow):
             f"Run Time: {result['run_time']}\n"
             f"Search Root: {self.input_dir}\n"
             f"Model Path: {self.model_path}\n"
+            f"Tracker Path: {getattr(self.detector, 'tracker_path', '') if self.detector else ''}\n"
             f"AI Device: {self.device}\n"
             f"AI Device Name: {self.device_info['name']}\n"
             f"Excluded Output Root: {self.excluded_dir}\n"
@@ -1360,6 +1436,7 @@ class MainWindow(QMainWindow):
             f"Long Stay Screenshots: {self.chk_long_stay_screenshots.isChecked()}\n"
             f"Export Clips: {self.chk_export_clips.isChecked()}\n"
             f"Draw ROI on Screenshot: {self.chk_draw_roi.isChecked()}\n"
+            f"Debug Stream Preview: {self.chk_debug_stream.isChecked()}\n"
             f"LPR Enabled: {self.chk_lpr.isChecked()}\n"
             f"LPR Plate Model Path: {self.lpr_plate_model_path if self.chk_lpr.isChecked() else ''}\n"
             f"LPR OCR Engine: {self.cmb_lpr_ocr.currentData() if self.chk_lpr.isChecked() else ''}\n"
@@ -1390,6 +1467,7 @@ class MainWindow(QMainWindow):
         )
 
     def cleanup_worker(self):
+        """Release QObject/QThread references after the worker thread exits."""
         if self.worker is not None:
             self.worker.deleteLater()
             self.worker = None
@@ -1410,6 +1488,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    """Launch the Qt GUI application."""
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

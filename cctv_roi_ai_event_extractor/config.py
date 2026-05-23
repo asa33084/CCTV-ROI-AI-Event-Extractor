@@ -3,6 +3,7 @@ import sys
 from dataclasses import dataclass
 
 
+# 所有設定都先從環境變數讀取，讓打包後的 EXE 與開發環境可以共用同一套邏輯。
 APP_VERSION = "4.4.0-roi-yolo26x-dragdrop-paste-paths"
 
 ENV_APP_DIR = "CCTV_ROI_APP_DIR"
@@ -24,6 +25,7 @@ ENV_LPR_PADDLE_OCR_VERSION = "CCTV_ROI_LPR_PADDLE_OCR_VERSION"
 ENV_LPR_PADDLE_DET_MODEL_NAME = "CCTV_ROI_LPR_PADDLE_DET_MODEL_NAME"
 ENV_LPR_PADDLE_REC_MODEL_NAME = "CCTV_ROI_LPR_PADDLE_REC_MODEL_NAME"
 ENV_ULTRALYTICS_CONFIG_DIR = "YOLO_CONFIG_DIR"
+_DOTENV_LOADED = False
 
 
 def _project_root() -> str:
@@ -31,7 +33,42 @@ def _project_root() -> str:
     return os.path.dirname(package_dir)
 
 
+def _unquote_env_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def load_dotenv_file(path: str | None = None) -> None:
+    """Load app-local .env values without overriding real environment variables."""
+    env_path = path or os.path.join(_project_root(), ".env")
+    if not os.path.exists(env_path):
+        return
+
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            text = line.strip()
+            if not text or text.startswith("#") or "=" not in text:
+                continue
+            key, value = text.split("=", 1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            os.environ[key] = _unquote_env_value(value)
+
+
+def ensure_dotenv_loaded() -> None:
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    load_dotenv_file()
+    _DOTENV_LOADED = True
+
+
 def resolve_app_dir() -> str:
+    ensure_dotenv_loaded()
+    """Resolve the directory used for models, ROI config, and runtime files."""
     env_value = os.getenv(ENV_APP_DIR)
     if env_value:
         return os.path.abspath(env_value)
@@ -41,6 +78,7 @@ def resolve_app_dir() -> str:
 
 
 def ensure_runtime_environment(app_dir: str | None = None) -> None:
+    """Keep third-party caches inside the app folder instead of the user profile."""
     base_dir = app_dir or resolve_app_dir()
     if not os.getenv(ENV_ULTRALYTICS_CONFIG_DIR):
         runtime_dir = os.path.join(base_dir, ".runtime", "ultralytics")
@@ -92,6 +130,8 @@ def resolve_int_env(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class AppConfig:
+    """Runtime configuration collected from environment variables."""
+
     app_dir: str
     model_path: str | None
     roi_config_path: str | None
@@ -113,6 +153,7 @@ class AppConfig:
 
     @classmethod
     def from_env(cls) -> "AppConfig":
+        ensure_dotenv_loaded()
         return cls(
             app_dir=resolve_app_dir(),
             model_path=os.getenv(ENV_MODEL_PATH),
@@ -136,4 +177,5 @@ class AppConfig:
 
 
 def load_config() -> AppConfig:
+    ensure_dotenv_loaded()
     return AppConfig.from_env()

@@ -10,12 +10,13 @@ from openpyxl.utils import get_column_letter
 
 
 VIDEO_DATETIME_PATTERNS = (
-    re.compile(r"(?P<date>20\d{6})[_-](?P<time>\d{6})"),
-    re.compile(r"p(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})[_-](?P<time>\d{6})", re.IGNORECASE),
+    re.compile(r"(?P<date>20\d{6})[_\-\u2013\u2014](?P<time>\d{6})"),
+    re.compile(r"p(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})[_\-\u2013\u2014](?P<time>\d{6})", re.IGNORECASE),
 )
 
 
 def parse_video_start_datetime(video_rel_path: str):
+    """Parse start time from known CCTV filename formats."""
     name = os.path.basename(video_rel_path or "")
     for pattern in VIDEO_DATETIME_PATTERNS:
         match = pattern.search(name)
@@ -33,6 +34,7 @@ def parse_video_start_datetime(video_rel_path: str):
 
 
 def format_event_datetime(video_rel_path: str, seconds_text: str):
+    """Convert a video-relative event timestamp to an absolute timestamp when possible."""
     if seconds_text is None or str(seconds_text).strip() == "":
         return ""
     start = parse_video_start_datetime(video_rel_path)
@@ -88,6 +90,7 @@ def _bbox_iou(a, b):
 
 
 def _plate_row_score(item):
+    """Score LPR rows so valid, confident, plate-length text wins deduplication."""
     try:
         confidence = max(float(part) for part in str(item.get("plate_confidence", "0")).split(";") if part)
     except ValueError:
@@ -99,6 +102,7 @@ def _plate_row_score(item):
 
 
 def _select_best_lpr_row(group):
+    """Pick the strongest row after grouping repeated sightings of the same plate."""
     text_scores = {}
     for item in group:
         text = str(item.get("plate_text", ""))
@@ -109,6 +113,7 @@ def _select_best_lpr_row(group):
 
 
 def _dedupe_lpr_rows(rows):
+    """Merge repeated LPR detections by video, time proximity, and plate-box overlap."""
     groups = []
     for row in sorted(rows, key=lambda item: _parse_seconds(item.get("event_time_sec"))):
         row_bbox = _parse_bbox(row.get("plate_bbox"))
@@ -130,8 +135,43 @@ def _dedupe_lpr_rows(rows):
     return [_select_best_lpr_row(group) for group in groups]
 
 
+def _track_row_identity(item):
+    camera_id = str(item.get("camera_id", ""))
+    stream_id = str(item.get("stream_id", ""))
+    track_id = str(item.get("track_id", ""))
+    if camera_id or stream_id or track_id:
+        return camera_id, stream_id, track_id
+    return str(item.get("track_start_source", "")), str(item.get("track_id", ""))
+
+
+def _dedupe_track_rows(rows):
+    """Keep one best row per tracked vehicle identity."""
+    groups = {}
+    for item in rows:
+        key = _track_row_identity(item)
+        current = groups.get(key)
+        if current is None or _plate_row_score(item) > _plate_row_score(current):
+            groups[key] = item
+    return list(groups.values())
+
+
 def build_evidence_rows(csv_rows):
+    """Convert raw processing log rows into workbook-ready evidence rows."""
     rows = []
+    track_rows = _dedupe_track_rows([item for item in csv_rows if item.get("record_type") == "track_summary"])
+    for item in track_rows:
+        plate_text = item.get("plate_text", "")
+        if not plate_text:
+            continue
+        rows.append({
+            "entry_datetime": item.get("track_start_datetime") or format_event_datetime(item.get("video_rel_path", ""), item.get("event_time_sec", "")),
+            "exit_datetime": item.get("track_end_datetime") or format_event_datetime(item.get("video_rel_path", ""), item.get("interval_end_sec", "")),
+            "plate_text": plate_text,
+            "screenshot_path": _first_existing_path([item.get("output_path")]) or "",
+        })
+    if rows:
+        return rows
+
     lpr_rows = [item for item in csv_rows if item.get("record_type") == "lpr_detection" and item.get("plate_text")]
     screenshot_rows = [item for item in csv_rows if item.get("record_type") == "screenshot"]
     for item in _dedupe_lpr_rows(lpr_rows) + screenshot_rows:
@@ -154,6 +194,7 @@ def build_evidence_rows(csv_rows):
 
 
 def write_evidence_workbook(output_path: str, csv_rows):
+    """Write the evidence workbook and embed screenshots when image files exist."""
     rows = build_evidence_rows(csv_rows)
 
     wb = Workbook()

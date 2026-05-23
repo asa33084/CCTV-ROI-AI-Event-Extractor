@@ -1,3 +1,5 @@
+"""Public API facade that re-exports processing, LPR, and report helpers."""
+
 from cctv_roi_ai_event_extractor.event_processing import (
     APP_VERSION,
     LONG_STAY_SCREENSHOT_INTERVAL_SEC,
@@ -23,6 +25,7 @@ from cctv_roi_ai_event_extractor.event_processing import (
     norm_path,
     point_in_polygon,
     polygon_bbox,
+    process_video_stream,
     process_video,
     resolve_default_model_path,
     safe_get_fps,
@@ -69,6 +72,7 @@ __all__ = [
     "norm_path",
     "point_in_polygon",
     "polygon_bbox",
+    "process_video_stream",
     "process_video",
     "resolve_default_model_path",
     "safe_get_fps",
