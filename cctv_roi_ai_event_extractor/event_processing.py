@@ -665,6 +665,7 @@ def _build_stream_debug_frame(stream_item, detections, polygon, polygon_np, plat
         polygon_np=polygon_np,
         draw_roi_on_screenshot=True,
         plate_recognitions=plate_recognitions,
+        show_plate_debug_crops=True,
     )
     header = (
         f"camera={stream_item.stream.camera_id} "
@@ -729,7 +730,7 @@ def process_video_stream(
         if export_clips:
             status_cb("[STREAM] 事件片段會以 track 進入時間為中心，依前後保留秒數輸出。")
         if debug_stream_preview:
-            status_cb("[DEBUG] Stream YOLO track 預覽已啟用；關閉 Qt 預覽視窗可停止顯示。")
+            status_cb("[DEBUG] Stream YOLO track / LPR crop 預覽已啟用；關閉 Qt 預覽視窗可停止顯示。")
 
     skipped_segments = 0
     success_segments = 0

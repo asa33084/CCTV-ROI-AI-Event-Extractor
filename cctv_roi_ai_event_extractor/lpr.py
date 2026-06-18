@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -63,6 +64,7 @@ class PlateRecognition:
     detector_score: float
     valid_taiwan_format: bool
     engine: str
+    debug_crop_bgr: object | None = None
 
 
 def normalize_taiwan_plate_text(raw_text: str) -> str:
@@ -244,18 +246,155 @@ class EasyOcrEngine(OcrEngine):
         return str(text), float(confidence)
 
 
+def _tesseract_executable_name() -> str:
+    return "tesseract.exe" if os.name == "nt" else "tesseract"
+
+
+def _candidate_tesseract_commands(path: str) -> list[str]:
+    """Expand either a tesseract executable path or a containing directory."""
+    if not path:
+        return []
+
+    clean = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+    executable = _tesseract_executable_name()
+    candidates = []
+    if os.path.isdir(clean):
+        candidates.append(os.path.join(clean, executable))
+        if os.name == "nt":
+            candidates.append(os.path.join(clean, "tesseract.exe"))
+    else:
+        candidates.append(clean)
+        root, ext = os.path.splitext(clean)
+        if os.name == "nt" and not ext:
+            candidates.append(f"{clean}.exe")
+    return candidates
+
+
+def resolve_tesseract_cmd(config=None) -> str | None:
+    """Find Tesseract from explicit config, PATH, bundled app paths, and common installs."""
+    config = config or load_config()
+    configured = (config.lpr_tesseract_cmd or "").strip()
+    candidates = _candidate_tesseract_commands(configured)
+
+    path_command = shutil.which("tesseract")
+    if path_command:
+        candidates.append(path_command)
+
+    executable = _tesseract_executable_name()
+    app_dir = os.path.abspath(config.app_dir)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates.extend([
+        os.path.join(app_dir, executable),
+        os.path.join(app_dir, "tesseract", executable),
+        os.path.join(app_dir, "Tesseract-OCR", "tesseract.exe"),
+        os.path.join(project_root, ".venv", "bin", "tesseract"),
+        os.path.join(project_root, ".venv", "Scripts", "tesseract.exe"),
+    ])
+
+    if os.name == "nt":
+        program_files = [
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ]
+        for base_dir in [item for item in program_files if item]:
+            candidates.append(os.path.join(base_dir, "Tesseract-OCR", "tesseract.exe"))
+    else:
+        candidates.extend([
+            "/usr/bin/tesseract",
+            "/usr/local/bin/tesseract",
+            "/opt/homebrew/bin/tesseract",
+            "/opt/local/bin/tesseract",
+        ])
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 class TesseractOcrEngine(OcrEngine):
     name = "tesseract"
 
     def __init__(self):
-        import pytesseract
+        try:
+            import pytesseract
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "使用 tesseract OCR 時必須先在目前 Python 環境安裝 pytesseract。"
+            ) from exc
 
         self.pytesseract = pytesseract
+        command = resolve_tesseract_cmd()
+        if not command:
+            raise FileNotFoundError(
+                "找不到 Tesseract 執行檔。請安裝 tesseract-ocr，或設定 "
+                "CCTV_ROI_LPR_TESSERACT_CMD 為 tesseract 執行檔或安裝資料夾。"
+            )
+        self.tesseract_cmd = command
+        self.pytesseract.pytesseract.tesseract_cmd = command
+
+    def _preprocess_variants(self, image_bgr):
+        import cv2
+
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        scale = max(2, int(round(96 / max(1, gray.shape[0]))))
+        scale = min(scale, 4)
+        resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        blurred = cv2.GaussianBlur(resized, (3, 3), 0)
+        _threshold, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        adaptive = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            5,
+        )
+        return (resized, otsu, adaptive)
+
+    def _recognize_variant(self, image, config: str) -> tuple[str, float]:
+        text = self.pytesseract.image_to_string(image, config=config).strip()
+        confidences = []
+        try:
+            data = self.pytesseract.image_to_data(
+                image,
+                config=config,
+                output_type=self.pytesseract.Output.DICT,
+            )
+        except Exception:
+            data = None
+        if data:
+            for value in data.get("conf", []):
+                try:
+                    confidence = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if confidence >= 0:
+                    confidences.append(confidence / 100.0)
+        return text, _mean_confidence(confidences)
 
     def recognize(self, image_bgr) -> tuple[str, float]:
-        config = "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
-        text = self.pytesseract.image_to_string(image_bgr, config=config)
-        return text, 0.0
+        config = "--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+        candidates = [
+            self._recognize_variant(image, config)
+            for image in self._preprocess_variants(image_bgr)
+        ]
+        candidates = [item for item in candidates if item[0].strip()]
+        if not candidates:
+            return "", 0.0
+        return max(
+            candidates,
+            key=lambda item: (
+                is_valid_taiwan_plate(normalize_taiwan_plate_text(item[0])),
+                item[1],
+                len(normalize_taiwan_plate_text(item[0])),
+            ),
+        )
 
 
 def _mean_confidence(scores: list[float]) -> float:
@@ -586,8 +725,8 @@ class LicensePlateRecognizer:
             if crop is None:
                 continue
             # Rectification is best-effort; if no usable contour is found, the original crop is preserved.
-            crop = rectify_plate_crop(crop)
-            raw_text, ocr_conf = self.ocr.recognize(crop)
+            ocr_crop = rectify_plate_crop(crop)
+            raw_text, ocr_conf = self.ocr.recognize(ocr_crop)
             text = normalize_taiwan_plate_text(raw_text)
             recognitions.append(PlateRecognition(
                 text=text,
@@ -597,17 +736,69 @@ class LicensePlateRecognizer:
                 detector_score=plate.score,
                 valid_taiwan_format=is_valid_taiwan_plate(text),
                 engine=self.engine_name,
+                debug_crop_bgr=ocr_crop.copy() if ocr_crop is not None else None,
             ))
         return recognitions
 
 
-def draw_plate_recognitions(frame, recognitions):
+def _draw_plate_debug_crop(frame, item, index):
     import cv2
 
+    crop = getattr(item, "debug_crop_bgr", None)
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return
+
+    frame_h, frame_w = frame.shape[:2]
+    crop_h, crop_w = crop.shape[:2]
+    if crop_h <= 0 or crop_w <= 0:
+        return
+
+    target_w = min(220, max(96, int(frame_w * 0.18)))
+    target_w = min(target_w, max(24, frame_w - 12))
+    scale = target_w / crop_w
+    target_h = max(24, int(round(crop_h * scale)))
+    if target_h > 96:
+        target_h = 96
+        target_w = max(48, int(round(crop_w * (target_h / crop_h))))
+    target_h = min(target_h, max(16, frame_h - 32))
+    target_w = min(target_w, max(24, frame_w - 12))
+
+    x1, y1, x2, y2 = item.bbox
+    pad = 6
+    label_h = 20
+    panel_w = target_w + pad * 2
+    panel_h = target_h + label_h + pad * 2
+    px = min(max(0, x1), max(0, frame_w - panel_w))
+    below_y = y2 + 8
+    above_y = y1 - panel_h - 8
+    py = below_y if below_y + panel_h <= frame_h else max(0, above_y)
+
+    color = (255, 0, 255) if item.valid_taiwan_format else (255, 180, 0)
+    roi = frame[py:py + panel_h, px:px + panel_w]
+    overlay = roi.copy()
+    cv2.rectangle(overlay, (0, 0), (panel_w - 1, panel_h - 1), (24, 24, 24), -1)
+    cv2.addWeighted(overlay, 0.78, roi, 0.22, 0, dst=roi)
+    cv2.rectangle(frame, (px, py), (px + panel_w - 1, py + panel_h - 1), color, 2)
+
+    thumb = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    tx = px + pad
+    ty = py + label_h + pad
+    frame[ty:ty + target_h, tx:tx + target_w] = thumb
+    label = f"OCR crop {index}"
+    cv2.putText(frame, label, (px + pad, py + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+
+def draw_plate_recognitions(frame, recognitions, show_debug_crops=False):
+    import cv2
+
+    crop_index = 1
     for item in recognitions or []:
         x1, y1, x2, y2 = item.bbox
         color = (255, 0, 255) if item.valid_taiwan_format else (255, 180, 0)
         label = item.text or "plate"
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame, label, (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        if show_debug_crops:
+            _draw_plate_debug_crop(frame, item, crop_index)
+            crop_index += 1
     return frame

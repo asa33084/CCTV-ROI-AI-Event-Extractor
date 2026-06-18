@@ -69,6 +69,7 @@ from cctv_roi_ai_event_extractor.evidence_report import write_evidence_workbook
 LPR_OCR_CHOICES = (
     ("PaddleOCR（PP-OCRv5）", "paddleocr"),
     ("SVTR / ONNX", "svtr"),
+    ("Tesseract OCR", "tesseract"),
 )
 
 
@@ -77,6 +78,8 @@ def normalize_selectable_lpr_ocr_engine(engine_name: str | None) -> str:
     name = (engine_name or "").strip().lower()
     if name in {"svtr", "transformer"}:
         return "svtr"
+    if name in {"tesseract", "pytesseract"}:
+        return "tesseract"
     return "paddleocr"
 
 
@@ -768,7 +771,7 @@ class MainWindow(QMainWindow):
         self.chk_lpr.setChecked(self.lpr_enabled)
         option_row.addWidget(self.chk_lpr)
 
-        self.chk_debug_stream = QCheckBox("Debug track 預覽")
+        self.chk_debug_stream = QCheckBox("Debug track / 車牌 crop 預覽")
         self.chk_debug_stream.setChecked(False)
         option_row.addWidget(self.chk_debug_stream)
 
@@ -821,7 +824,7 @@ class MainWindow(QMainWindow):
             "Polygon ROI 操作：左鍵加點、右鍵刪點、清空、確認。\n"
             "邏輯說明：偵測區控制事件起訖；啟用車牌辨識時，會對偵測區內的所有車輛執行 LPR，不依賴觸碰區或連續追蹤。\n"
             "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段以事件時間點為中心輸出原始影片。"
-            "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可在 PaddleOCR 或 SVTR / ONNX 二選一。"
+            "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可選 PaddleOCR、SVTR / ONNX 或 Tesseract。"
         )
         layout.addWidget(help_text)
 

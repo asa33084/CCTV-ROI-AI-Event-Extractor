@@ -229,10 +229,19 @@ def polygon_bbox(polygon):
     return x, y, w, h
 
 
-def build_screenshot_frame(frame, detections, polygon, polygon_np, draw_roi_on_screenshot, plate_recognitions=None, touch_polygon=None):
+def build_screenshot_frame(
+    frame,
+    detections,
+    polygon,
+    polygon_np,
+    draw_roi_on_screenshot,
+    plate_recognitions=None,
+    touch_polygon=None,
+    show_plate_debug_crops=False,
+):
     if not draw_roi_on_screenshot:
         annotated = frame.copy()
-        return draw_plate_recognitions(annotated, plate_recognitions)
+        return draw_plate_recognitions(annotated, plate_recognitions, show_debug_crops=show_plate_debug_crops)
 
     annotated = draw_polygon_overlay(frame.copy(), polygon)
     if touch_polygon:
@@ -242,5 +251,5 @@ def build_screenshot_frame(frame, detections, polygon, polygon_np, draw_roi_on_s
         inside = point_in_polygon(anchor, polygon_np)
         draw_detection(annotated, det, inside=inside)
         draw_anchor_point(annotated, anchor, inside=inside)
-    draw_plate_recognitions(annotated, plate_recognitions)
+    draw_plate_recognitions(annotated, plate_recognitions, show_debug_crops=show_plate_debug_crops)
     return annotated
