@@ -24,6 +24,7 @@ ENV_LPR_PADDLE_DEVICE = "CCTV_ROI_LPR_PADDLE_DEVICE"
 ENV_LPR_PADDLE_OCR_VERSION = "CCTV_ROI_LPR_PADDLE_OCR_VERSION"
 ENV_LPR_PADDLE_DET_MODEL_NAME = "CCTV_ROI_LPR_PADDLE_DET_MODEL_NAME"
 ENV_LPR_PADDLE_REC_MODEL_NAME = "CCTV_ROI_LPR_PADDLE_REC_MODEL_NAME"
+ENV_LPR_TESSERACT_CMD = "CCTV_ROI_LPR_TESSERACT_CMD"
 ENV_ULTRALYTICS_CONFIG_DIR = "YOLO_CONFIG_DIR"
 _DOTENV_LOADED = False
 
@@ -150,6 +151,7 @@ class AppConfig:
     lpr_paddle_ocr_version: str
     lpr_paddle_det_model_name: str
     lpr_paddle_rec_model_name: str
+    lpr_tesseract_cmd: str
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -173,6 +175,7 @@ class AppConfig:
             lpr_paddle_ocr_version=os.getenv(ENV_LPR_PADDLE_OCR_VERSION, "PP-OCRv5"),
             lpr_paddle_det_model_name=os.getenv(ENV_LPR_PADDLE_DET_MODEL_NAME, "PP-OCRv5_mobile_det"),
             lpr_paddle_rec_model_name=os.getenv(ENV_LPR_PADDLE_REC_MODEL_NAME, "PP-OCRv5_mobile_rec"),
+            lpr_tesseract_cmd=os.getenv(ENV_LPR_TESSERACT_CMD, ""),
         )
 
 

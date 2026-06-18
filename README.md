@@ -139,6 +139,19 @@ export CCTV_ROI_LPR_PADDLE_DEVICE="gpu:0"
 .venv\Scripts\python.exe -m cctv_roi_ai_event_extractor
 ```
 
+若要在 Windows 使用 `Tesseract OCR` 車牌辨識，除了 `requirements.txt` 內的 `pytesseract`，還需要安裝 Tesseract OCR 執行檔。可用 winget 安裝：
+
+```powershell
+winget install --id UB-Mannheim.TesseractOCR -e
+```
+
+安裝後通常會位於 `C:\Program Files\Tesseract-OCR\tesseract.exe`。程式會自動查常見安裝位置；若要明確指定，可把資料夾或完整 exe 路徑寫入環境變數：
+
+```powershell
+$env:CCTV_ROI_LPR_OCR_ENGINE="tesseract"
+$env:CCTV_ROI_LPR_TESSERACT_CMD="C:\Program Files\Tesseract-OCR"
+```
+
 ### 3. 安裝 PyTorch
 
 本專案會用到 `torch` 做 CUDA 自動判斷與 GPU 推論。
@@ -236,12 +249,13 @@ $env:CCTV_ROI_LPR_SVTR_CHARSET="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 $env:CCTV_ROI_LPR_SVTR_INPUT_SIZE="48x160"
 $env:CCTV_ROI_LPR_SVTR_BLANK_INDEX="0"
 $env:CCTV_ROI_LPR_SVTR_PROVIDERS="auto"
+$env:CCTV_ROI_LPR_TESSERACT_CMD="C:\Program Files\Tesseract-OCR"
 ```
 
 說明：
 
 - `CCTV_ROI_LPR_PLATE_MODEL_PATH`：車牌偵測 YOLO 模型路徑。
-- `CCTV_ROI_LPR_OCR_ENGINE`：GUI 會提供 `paddleocr` 與 `svtr` 二選一；環境變數可用來指定初始選項。建議先用 `paddleocr` 作為通用 OCR，若有自訓臺灣車牌模型再使用 `svtr`。
+- `CCTV_ROI_LPR_OCR_ENGINE`：GUI 會提供 `paddleocr`、`svtr` 與 `tesseract`；環境變數可用來指定初始選項。建議先用 `paddleocr` 作為通用 OCR，若有自訓臺灣車牌模型再使用 `svtr`，需要輕量本機 OCR 時可用 `tesseract`。
 - `CCTV_ROI_LPR_PADDLE_OCR_VERSION`：PaddleOCR 版本，預設 `PP-OCRv5`。
 - `CCTV_ROI_LPR_PADDLE_DET_MODEL_NAME` / `CCTV_ROI_LPR_PADDLE_REC_MODEL_NAME`：PaddleOCR 偵測與辨識模型名稱，預設使用 PP-OCRv5 mobile 模型。
 - `CCTV_ROI_LPR_PADDLE_DEVICE`：PaddleOCR 推論裝置，例如 `cpu`、`gpu:0`；留空則使用 PaddleOCR 預設值。
@@ -252,6 +266,8 @@ $env:CCTV_ROI_LPR_SVTR_PROVIDERS="auto"
 - `CCTV_ROI_LPR_SVTR_BLANK_INDEX`：CTC blank index，常見為 `0`。
 - `CCTV_ROI_LPR_SVTR_PROVIDERS`：ONNX Runtime provider，`auto` 會優先使用 CUDA / DirectML / CPU 中可用者。
 - PaddleOCR 是可選依賴，啟用前需依 PaddleOCR 官方安裝方式安裝 `paddleocr` 與 PaddlePaddle；專案使用 PaddleOCR v3 的 `PaddleOCR(...).predict(...)` API，並預設關閉文件方向分類、文件展平與文字行方向分類。
+- `CCTV_ROI_LPR_TESSERACT_CMD`：Tesseract 執行檔或安裝資料夾。可留空，程式會自動查 PATH、專案/App 目錄、`.venv/bin`、`.venv/Scripts` 與常見 Windows/Linux/macOS 安裝位置；若填資料夾會自動補上 `tesseract` 或 `tesseract.exe`。
+- Tesseract OCR 需同時安裝 Python 套件 `pytesseract` 與系統層 Tesseract 執行檔；Windows 可安裝到 `C:\Program Files\Tesseract-OCR`，Linux 可用系統套件管理器安裝 `tesseract-ocr`。
 - CRNN / LPRNet / 其他 Transformer OCR 也可接到 `lpr.py` 的 `OcrEngine` 介面；輸出會先經臺灣牌照格式校正後寫入 CSV。
 
 ## 啟動方式
