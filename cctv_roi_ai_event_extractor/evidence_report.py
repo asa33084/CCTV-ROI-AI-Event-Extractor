@@ -10,6 +10,7 @@ from openpyxl.utils import get_column_letter
 
 
 VIDEO_DATETIME_PATTERNS = (
+    re.compile(r"(?P<iso_date>20\d{2}-\d{2}-\d{2})T(?P<iso_time>\d{2}-\d{2}-\d{2})Z_", re.IGNORECASE),
     re.compile(r"(?P<date>20\d{6})[_\-\u2013\u2014](?P<time>\d{6})"),
     re.compile(r"p(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})[_\-\u2013\u2014](?P<time>\d{6})", re.IGNORECASE),
 )
@@ -23,6 +24,10 @@ def parse_video_start_datetime(video_rel_path: str):
         if not match:
             continue
         groups = match.groupdict()
+        if groups.get("iso_date"):
+            raw_date = groups["iso_date"]
+            raw_time = groups["iso_time"]
+            return datetime.strptime(raw_date + raw_time, "%Y-%m-%d%H-%M-%S")
         if "date" in groups and groups.get("date"):
             raw_date = groups["date"]
             raw_time = groups["time"]

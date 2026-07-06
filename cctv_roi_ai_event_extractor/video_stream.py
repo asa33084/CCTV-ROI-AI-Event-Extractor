@@ -16,6 +16,11 @@ _P_CAMERA_PATTERN = re.compile(
     r"[_\-\u2013\u2014](?P<start>\d{6})(?:[_\-\u2013\u2014](?P<end>\d{6}))?",
     re.IGNORECASE,
 )
+_ISO_Z_CAMERA_PATTERN = re.compile(
+    r"(?P<date>20\d{2}-\d{2}-\d{2})T(?P<time>\d{2}-\d{2}-\d{2})Z_"
+    r"(?P<camera>[^_]+)(?:_.*)?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,16 @@ def parse_video_filename(path: str, rel_path: str | None = None) -> VideoSegment
     """Infer camera id and timestamps from supported CCTV filename patterns."""
     name = os.path.splitext(os.path.basename(path or ""))[0]
     rel = rel_path or os.path.basename(path or "")
+
+    match = _ISO_Z_CAMERA_PATTERN.search(name)
+    if match:
+        start = datetime.strptime(match.group("date") + match.group("time"), "%Y-%m-%d%H-%M-%S")
+        return VideoSegment(
+            path=path,
+            rel_path=rel,
+            camera_id=_clean_camera_id(match.group("camera")),
+            start_datetime=start,
+        )
 
     match = _P_CAMERA_PATTERN.search(name)
     if match:
