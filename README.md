@@ -239,7 +239,7 @@ GUI 的「每幾幀偵測一次」在 stream track 流程會同時控制 YOLO tr
 $env:CCTV_ROI_LPR_ENABLED="true"
 $env:CCTV_ROI_LPR_PLATE_MODEL_PATH="C:\models\license_plate_yolo.pt"
 $env:CCTV_ROI_LPR_OCR_ENGINE="paddleocr"
-$env:CCTV_ROI_LPR_CONFIDENCE="0.35"
+$env:CCTV_ROI_LPR_CONFIDENCE="0.50"
 $env:CCTV_ROI_LPR_PADDLE_OCR_VERSION="PP-OCRv5"
 $env:CCTV_ROI_LPR_PADDLE_DET_MODEL_NAME="PP-OCRv5_mobile_det"
 $env:CCTV_ROI_LPR_PADDLE_REC_MODEL_NAME="PP-OCRv5_mobile_rec"
@@ -249,13 +249,16 @@ $env:CCTV_ROI_LPR_SVTR_CHARSET="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 $env:CCTV_ROI_LPR_SVTR_INPUT_SIZE="48x160"
 $env:CCTV_ROI_LPR_SVTR_BLANK_INDEX="0"
 $env:CCTV_ROI_LPR_SVTR_PROVIDERS="auto"
+$env:CCTV_ROI_LPR_YOLO_OCR_MODEL_PATH="C:\models\plate_number_yolo26x.pt"
+$env:CCTV_ROI_LPR_YOLO_OCR_CONFIDENCE="0.35"
 $env:CCTV_ROI_LPR_TESSERACT_CMD="C:\Program Files\Tesseract-OCR"
 ```
 
 說明：
 
 - `CCTV_ROI_LPR_PLATE_MODEL_PATH`：車牌偵測 YOLO 模型路徑。
-- `CCTV_ROI_LPR_OCR_ENGINE`：GUI 會提供 `paddleocr`、`svtr` 與 `tesseract`；環境變數可用來指定初始選項。建議先用 `paddleocr` 作為通用 OCR，若有自訓臺灣車牌模型再使用 `svtr`，需要輕量本機 OCR 時可用 `tesseract`。
+- `CCTV_ROI_LPR_CONFIDENCE`：車牌偵測 YOLO bbox 信心門檻，預設 `0.50`；提高可減少低品質 crop 進入 OCR，但太高可能漏掉遠距或模糊車牌。
+- `CCTV_ROI_LPR_OCR_ENGINE`：GUI 會提供 `paddleocr`、`svtr`、`plate_number_yolo26x` 與 `tesseract`；環境變數可用來指定初始選項。建議先用 `paddleocr` 作為通用 OCR，若有自訓臺灣車牌模型可使用 `svtr` 或 `plate_number_yolo26x`，需要輕量本機 OCR 時可用 `tesseract`。
 - `CCTV_ROI_LPR_PADDLE_OCR_VERSION`：PaddleOCR 版本，預設 `PP-OCRv5`。
 - `CCTV_ROI_LPR_PADDLE_DET_MODEL_NAME` / `CCTV_ROI_LPR_PADDLE_REC_MODEL_NAME`：PaddleOCR 偵測與辨識模型名稱，預設使用 PP-OCRv5 mobile 模型。
 - `CCTV_ROI_LPR_PADDLE_DEVICE`：PaddleOCR 推論裝置，例如 `cpu`、`gpu:0`；留空則使用 PaddleOCR 預設值。
@@ -265,6 +268,8 @@ $env:CCTV_ROI_LPR_TESSERACT_CMD="C:\Program Files\Tesseract-OCR"
 - `CCTV_ROI_LPR_SVTR_INPUT_SIZE`：OCR 模型輸入尺寸，格式為 `高度x寬度`。
 - `CCTV_ROI_LPR_SVTR_BLANK_INDEX`：CTC blank index，常見為 `0`。
 - `CCTV_ROI_LPR_SVTR_PROVIDERS`：ONNX Runtime provider，`auto` 會優先使用 CUDA / DirectML / CPU 中可用者。
+- `CCTV_ROI_LPR_YOLO_OCR_MODEL_PATH`：YOLO26x 車牌號碼 OCR 模型路徑；未設定時會找 `models\plate_number_yolo26x.pt`。模型應在車牌 crop 中偵測單一英數字元，類別名稱使用 `0-9` / `A-Z`，程式會依 x 座標由左到右組成車牌文字。
+- `CCTV_ROI_LPR_YOLO_OCR_CONFIDENCE`：YOLO26x 字元 OCR 信心門檻，預設 `0.35`；與車牌 bbox 門檻分開，避免提高 crop 品質時過度濾掉字元。
 - PaddleOCR 是可選依賴，啟用前需依 PaddleOCR 官方安裝方式安裝 `paddleocr` 與 PaddlePaddle；專案使用 PaddleOCR v3 的 `PaddleOCR(...).predict(...)` API，並預設關閉文件方向分類、文件展平與文字行方向分類。
 - `CCTV_ROI_LPR_TESSERACT_CMD`：Tesseract 執行檔或安裝資料夾。可留空，程式會自動查 PATH、專案/App 目錄、`.venv/bin`、`.venv/Scripts` 與常見 Windows/Linux/macOS 安裝位置；若填資料夾會自動補上 `tesseract` 或 `tesseract.exe`。
 - Tesseract OCR 需同時安裝 Python 套件 `pytesseract` 與系統層 Tesseract 執行檔；Windows 可安裝到 `C:\Program Files\Tesseract-OCR`，Linux 可用系統套件管理器安裝 `tesseract-ocr`。

@@ -768,6 +768,8 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
                     "plate_raw_text",
                     "plate_confidence",
                     "plate_bbox",
+                    "plate_crop_path",
+                    "plate_crop_quality",
                     "plate_valid_taiwan_format",
                     "plate_ocr_engine",
                 ],
@@ -1014,6 +1016,8 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
                     "plate_raw_text": item.get("plate_raw_text", ""),
                     "plate_confidence": item.get("plate_confidence", ""),
                     "plate_bbox": item.get("plate_bbox", ""),
+                    "plate_crop_path": item.get("plate_crop_path", ""),
+                    "plate_crop_quality": item.get("plate_crop_quality", ""),
                     "plate_valid_taiwan_format": item.get("plate_valid_taiwan_format", ""),
                     "plate_ocr_engine": item.get("plate_ocr_engine", ""),
                 })

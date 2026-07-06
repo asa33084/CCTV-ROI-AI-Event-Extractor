@@ -6,8 +6,6 @@ from cctv_roi_ai_event_extractor.event_processing import (
     ObjectDetector,
     PolygonROIPicker,
     build_screenshot_frame,
-    draw_anchor_point,
-    draw_detection,
     draw_polygon_overlay,
     describe_available_compute_devices,
     ensure_model_available,
@@ -35,6 +33,10 @@ from cctv_roi_ai_event_extractor.event_processing import (
     save_roi_config,
     save_roi_regions,
     try_save_screenshot,
+)
+from cctv_roi_ai_event_extractor.vision_utils import (
+    draw_anchor_point,
+    draw_detection,
 )
 from cctv_roi_ai_event_extractor.lpr import (
     LicensePlateRecognizer,

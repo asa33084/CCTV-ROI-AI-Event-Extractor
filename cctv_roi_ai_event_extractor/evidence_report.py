@@ -49,8 +49,10 @@ def format_event_datetime(video_rel_path: str, seconds_text: str):
 
 def _first_existing_path(paths):
     for path in paths:
-        if path and os.path.exists(path):
-            return path
+        for candidate in str(path or "").split(";"):
+            candidate = candidate.strip()
+            if candidate and os.path.exists(candidate):
+                return candidate
     return None
 
 
@@ -95,10 +97,14 @@ def _plate_row_score(item):
         confidence = max(float(part) for part in str(item.get("plate_confidence", "0")).split(";") if part)
     except ValueError:
         confidence = 0.0
+    try:
+        crop_quality = max(float(part) for part in str(item.get("plate_crop_quality", "0")).split(";") if part)
+    except ValueError:
+        crop_quality = 0.0
     valid_bonus = 1.0 if "Y" in str(item.get("plate_valid_taiwan_format", "")) else 0.0
     text = str(item.get("plate_text", ""))
     length_bonus = 0.2 if 4 <= len(text) <= 8 else -1.0
-    return valid_bonus + confidence + length_bonus
+    return valid_bonus + confidence + crop_quality + length_bonus
 
 
 def _select_best_lpr_row(group):
@@ -167,6 +173,7 @@ def build_evidence_rows(csv_rows):
             "entry_datetime": item.get("track_start_datetime") or format_event_datetime(item.get("video_rel_path", ""), item.get("event_time_sec", "")),
             "exit_datetime": item.get("track_end_datetime") or format_event_datetime(item.get("video_rel_path", ""), item.get("interval_end_sec", "")),
             "plate_text": plate_text,
+            "plate_crop_path": _first_existing_path([item.get("plate_crop_path")]) or "",
             "screenshot_path": _first_existing_path([item.get("output_path")]) or "",
         })
     if rows:
@@ -188,6 +195,7 @@ def build_evidence_rows(csv_rows):
             "entry_datetime": format_event_datetime(item.get("video_rel_path", ""), item.get("event_time_sec", "")),
             "exit_datetime": format_event_datetime(item.get("video_rel_path", ""), item.get("interval_end_sec", "")),
             "plate_text": plate_text,
+            "plate_crop_path": _first_existing_path([item.get("plate_crop_path")]) or "",
             "screenshot_path": screenshot_path or "",
         })
     return rows
@@ -201,7 +209,7 @@ def write_evidence_workbook(output_path: str, csv_rows):
     ws = wb.active
     ws.title = "蒐證資料"
 
-    headers = ["編號", "進入日期", "出去日期", "車號", "車輛截圖"]
+    headers = ["編號", "進入日期", "出去日期", "車號", "車牌 Crop", "車輛截圖"]
     ws.append(headers)
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
@@ -215,7 +223,8 @@ def write_evidence_workbook(output_path: str, csv_rows):
     ws.column_dimensions["B"].width = 22
     ws.column_dimensions["C"].width = 22
     ws.column_dimensions["D"].width = 16
-    ws.column_dimensions["E"].width = 34
+    ws.column_dimensions["E"].width = 24
+    ws.column_dimensions["F"].width = 34
 
     for idx, item in enumerate(rows, start=1):
         row_idx = idx + 1
@@ -225,8 +234,17 @@ def write_evidence_workbook(output_path: str, csv_rows):
         ws.cell(row=row_idx, column=4, value=item["plate_text"])
         ws.row_dimensions[row_idx].height = 82
 
-        for col_idx in range(1, 5):
+        for col_idx in range(1, 7):
             ws.cell(row=row_idx, column=col_idx).alignment = Alignment(horizontal="center", vertical="center")
+
+        if item.get("plate_crop_path"):
+            try:
+                crop_img = ExcelImage(item["plate_crop_path"])
+                crop_img.width = 150
+                crop_img.height = 56
+                ws.add_image(crop_img, f"E{row_idx}")
+            except Exception:
+                ws.cell(row=row_idx, column=5, value=item["plate_crop_path"])
 
         if not item["screenshot_path"]:
             continue
@@ -234,11 +252,11 @@ def write_evidence_workbook(output_path: str, csv_rows):
             img = ExcelImage(item["screenshot_path"])
             img.width = 160
             img.height = 90
-            ws.add_image(img, f"E{row_idx}")
+            ws.add_image(img, f"F{row_idx}")
         except Exception:
-            ws.cell(row=row_idx, column=5, value=item["screenshot_path"])
+            ws.cell(row=row_idx, column=6, value=item["screenshot_path"])
 
-    for row in ws.iter_rows(min_row=1, max_row=max(1, len(rows) + 1), min_col=1, max_col=5):
+    for row in ws.iter_rows(min_row=1, max_row=max(1, len(rows) + 1), min_col=1, max_col=6):
         for cell in row:
             alignment = copy(cell.alignment)
             alignment.wrap_text = True

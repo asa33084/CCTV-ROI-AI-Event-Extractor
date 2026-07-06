@@ -16,8 +16,14 @@ TAIWAN_PLATE_PATTERNS = (
     re.compile(r"^[0-9]{4}[A-Z]{2}$"),
     re.compile(r"^[A-Z]{2}[0-9]{3}$"),
 )
+PLATE_TEXT_CLEAN_RE = re.compile(r"[^A-Z0-9]")
+YOLO_LABEL_CLEAN_RE = re.compile(r"[^A-Z0-9_ -]")
+YOLO_LABEL_SPLIT_RE = re.compile(r"[_ -]+")
 PLATE_TEXT_MIN_LEN = 4
 PLATE_TEXT_MAX_LEN = 8
+OCR_CROP_MIN_HEIGHT = 96
+OCR_CROP_MIN_WIDTH = 240
+OCR_CROP_MAX_SCALE = 4.0
 
 STRIP_MAP = str.maketrans({
     " ": "",
@@ -65,12 +71,16 @@ class PlateRecognition:
     valid_taiwan_format: bool
     engine: str
     debug_crop_bgr: object | None = None
+    crop_quality: float = 0.0
+    sharpness_score: float = 0.0
+    crop_size_score: float = 0.0
+    exposure_score: float = 0.0
 
 
 def normalize_taiwan_plate_text(raw_text: str) -> str:
     """Normalize OCR text and prefer candidates matching Taiwan plate layouts."""
     text = (raw_text or "").upper()
-    text = re.sub(r"[^A-Z0-9]", "", text)
+    text = PLATE_TEXT_CLEAN_RE.sub("", text)
     if not text:
         return ""
 
@@ -124,7 +134,7 @@ def _taiwan_plate_position_candidates(text: str) -> list[str]:
 
 
 def is_valid_taiwan_plate(text: str) -> bool:
-    clean = re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+    clean = PLATE_TEXT_CLEAN_RE.sub("", (text or "").upper())
     return any(pattern.match(clean) for pattern in TAIWAN_PLATE_PATTERNS)
 
 
@@ -153,6 +163,13 @@ def crop_bbox_with_offset(frame, bbox, padding_ratio: float = 0.06):
     return frame[y1:y2, x1:x2].copy(), x1, y1
 
 
+def _plate_like_aspect_ratio(width: float, height: float) -> bool:
+    short_side = max(1.0, min(float(width), float(height)))
+    long_side = max(float(width), float(height))
+    ratio = long_side / short_side
+    return 1.8 <= ratio <= 8.0
+
+
 def rectify_plate_crop(plate_bgr):
     import cv2
     import numpy as np
@@ -178,6 +195,12 @@ def rectify_plate_crop(plate_bgr):
     height = int(min(rect[1]))
     if width <= 0 or height <= 0:
         return plate_bgr
+    if not _plate_like_aspect_ratio(width, height):
+        return plate_bgr
+    rect_area = float(width * height)
+    crop_area = float(plate_bgr.shape[0] * plate_bgr.shape[1])
+    if rect_area < crop_area * 0.25:
+        return plate_bgr
     if height > width:
         width, height = height, width
 
@@ -194,10 +217,96 @@ def rectify_plate_crop(plate_bgr):
     return cv2.warpPerspective(plate_bgr, matrix, (width, height))
 
 
+def enhance_plate_crop_for_ocr(plate_bgr):
+    """Upscale and enhance a plate crop while preserving a natural BGR image for OCR engines."""
+    import cv2
+
+    if plate_bgr is None or plate_bgr.size == 0:
+        return plate_bgr
+
+    height, width = plate_bgr.shape[:2]
+    if height <= 0 or width <= 0:
+        return plate_bgr
+
+    scale = max(OCR_CROP_MIN_HEIGHT / height, OCR_CROP_MIN_WIDTH / width, 1.0)
+    scale = min(scale, OCR_CROP_MAX_SCALE)
+    enhanced = plate_bgr
+    if scale > 1.01:
+        enhanced = cv2.resize(
+            enhanced,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    tile_size = max(4, min(8, min(l_channel.shape[:2]) // 8 or 4))
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_size, tile_size))
+    l_channel = clahe.apply(l_channel)
+    enhanced = cv2.cvtColor(cv2.merge((l_channel, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
+
+    enhanced = cv2.bilateralFilter(enhanced, 5, 35, 35)
+    blurred = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+    enhanced = cv2.addWeighted(enhanced, 1.45, blurred, -0.45, 0)
+
+    border_y = max(2, int(round(enhanced.shape[0] * 0.04)))
+    border_x = max(4, int(round(enhanced.shape[1] * 0.03)))
+    return cv2.copyMakeBorder(enhanced, border_y, border_y, border_x, border_x, cv2.BORDER_REPLICATE)
+
+
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def plate_crop_quality_scores(plate_bgr) -> tuple[float, float, float]:
+    """Score OCR crop sharpness, usable size, and exposure on normalized 0..1 scales."""
+    import cv2
+
+    if plate_bgr is None or plate_bgr.size == 0:
+        return 0.0, 0.0, 0.0
+
+    height, width = plate_bgr.shape[:2]
+    if height <= 0 or width <= 0:
+        return 0.0, 0.0, 0.0
+
+    gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
+    laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    sharpness_score = _clamp_score(laplacian_var / 500.0)
+
+    crop_size_score = _clamp_score(min(width / OCR_CROP_MIN_WIDTH, height / OCR_CROP_MIN_HEIGHT))
+
+    mean_value = float(gray.mean())
+    std_value = float(gray.std())
+    mean_score = 1.0 - (abs(mean_value - 128.0) / 128.0)
+    contrast_score = _clamp_score(std_value / 50.0)
+    exposure_score = _clamp_score(mean_score) * contrast_score
+    return sharpness_score, crop_size_score, exposure_score
+
+
+def plate_recognition_quality_score(
+    detector_score: float,
+    sharpness_score: float,
+    crop_size_score: float,
+    exposure_score: float,
+    ocr_confidence: float,
+    valid_taiwan_format: bool,
+) -> float:
+    """Combine detector, crop, and OCR signals so the best crop wins across a track."""
+    valid_bonus = 0.25 if valid_taiwan_format else 0.0
+    return (
+        0.35 * _clamp_score(detector_score)
+        + 0.20 * _clamp_score(sharpness_score)
+        + 0.15 * _clamp_score(crop_size_score)
+        + 0.10 * _clamp_score(exposure_score)
+        + 0.20 * _clamp_score(ocr_confidence)
+        + valid_bonus
+    )
+
+
 class YoloPlateDetector:
     """YOLO wrapper that returns plate boxes in a small project-specific shape."""
 
-    def __init__(self, model_path: str, conf: float = 0.35, device: str | None = None):
+    def __init__(self, model_path: str, conf: float = 0.50, device: str | None = None):
         from ultralytics import YOLO
 
         self.model_path = os.path.abspath(model_path)
@@ -387,14 +496,12 @@ class TesseractOcrEngine(OcrEngine):
         candidates = [item for item in candidates if item[0].strip()]
         if not candidates:
             return "", 0.0
-        return max(
-            candidates,
-            key=lambda item: (
-                is_valid_taiwan_plate(normalize_taiwan_plate_text(item[0])),
-                item[1],
-                len(normalize_taiwan_plate_text(item[0])),
-            ),
-        )
+        scored = []
+        for text, confidence in candidates:
+            normalized = normalize_taiwan_plate_text(text)
+            scored.append((is_valid_taiwan_plate(normalized), confidence, len(normalized), text, confidence))
+        _valid, _score, _length, text, confidence = max(scored, key=lambda item: item[:3])
+        return text, confidence
 
 
 def _mean_confidence(scores: list[float]) -> float:
@@ -665,10 +772,86 @@ class SvtrOcrEngine(OcrEngine):
         return ctc_decode(outputs[0], self.charset, blank_index=self.blank_index)
 
 
-def create_ocr_engine(engine_name: str | None) -> OcrEngine:
+YOLO_OCR_FALLBACK_CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _normalize_yolo_ocr_label(label: object, class_id: int | None = None) -> str:
+    text = str(label or "").strip().upper()
+    text = YOLO_LABEL_CLEAN_RE.sub("", text)
+    for token in reversed(YOLO_LABEL_SPLIT_RE.split(text)):
+        if len(token) == 1 and token.isalnum():
+            return token
+    if class_id is not None and 0 <= class_id < len(YOLO_OCR_FALLBACK_CHARSET):
+        return YOLO_OCR_FALLBACK_CHARSET[class_id]
+    return ""
+
+
+class PlateNumberYolo26xOcrEngine(OcrEngine):
+    """OCR engine for YOLO models that detect one alphanumeric class per plate character."""
+
+    name = "plate_number_yolo26x"
+
+    def __init__(self, device: str | None = None):
+        from ultralytics import YOLO
+
+        config = load_config()
+        model_path = config.lpr_yolo_ocr_model_path or os.path.join(
+            config.app_dir,
+            "models",
+            "plate_number_yolo26x.pt",
+        )
+        self.model_path = os.path.abspath(model_path)
+        if not os.path.exists(self.model_path):
+            raise FileNotFoundError(
+                "找不到 YOLO26x 車牌號碼 OCR 模型："
+                f"{self.model_path}\n請設定 CCTV_ROI_LPR_YOLO_OCR_MODEL_PATH，"
+                "或放置 models/plate_number_yolo26x.pt。"
+            )
+        self.model = YOLO(self.model_path)
+        self.conf = float(config.lpr_yolo_ocr_confidence)
+        self.device = device
+
+    def _class_label(self, result, class_id: int) -> str:
+        names = getattr(result, "names", None) or getattr(self.model, "names", None) or {}
+        if isinstance(names, Mapping):
+            label = names.get(class_id, names.get(str(class_id), ""))
+        else:
+            try:
+                label = names[class_id]
+            except (IndexError, TypeError):
+                label = ""
+        return _normalize_yolo_ocr_label(label, class_id=class_id)
+
+    def recognize(self, image_bgr) -> tuple[str, float]:
+        results = self.model(image_bgr, conf=self.conf, verbose=False, device=self.device)
+        chars = []
+        for result in results:
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                class_id = int(box.cls[0].item())
+                char = self._class_label(result, class_id)
+                if not char:
+                    continue
+                x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
+                confidence = float(box.conf[0].item())
+                chars.append(((x1 + x2) / 2.0, (y1 + y2) / 2.0, char, confidence))
+
+        if not chars:
+            return "", 0.0
+
+        chars.sort(key=lambda item: (item[0], item[1]))
+        text = "".join(item[2] for item in chars)
+        confidence = _mean_confidence([item[3] for item in chars])
+        return text, confidence
+
+
+def create_ocr_engine(engine_name: str | None, device: str | None = None) -> OcrEngine:
     name = (engine_name or "none").strip().lower()
     if name in ("svtr", "transformer"):
         return SvtrOcrEngine()
+    if name in ("plate_number_yolo26x", "yolo26x", "yolo_ocr", "yolo-char", "yolo_char"):
+        return PlateNumberYolo26xOcrEngine(device=device)
     if name in ("paddleocr", "paddle", "ppocr"):
         return PaddleOcrEngine()
     if name == "easyocr":
@@ -685,11 +868,11 @@ class LicensePlateRecognizer:
         self,
         plate_model_path: str,
         ocr_engine: str = "none",
-        conf: float = 0.35,
+        conf: float = 0.50,
         device: str | None = None,
     ):
         self.detector = YoloPlateDetector(plate_model_path, conf=conf, device=device)
-        self.ocr = create_ocr_engine(ocr_engine)
+        self.ocr = create_ocr_engine(ocr_engine, device=device)
 
     @property
     def engine_name(self):
@@ -721,22 +904,37 @@ class LicensePlateRecognizer:
             plate_sources = self.detector.detect(frame)
 
         for plate in plate_sources:
-            crop = crop_bbox(frame, plate.bbox)
+            crop = crop_bbox(frame, plate.bbox, padding_ratio=0.10)
             if crop is None:
                 continue
-            # Rectification is best-effort; if no usable contour is found, the original crop is preserved.
-            ocr_crop = rectify_plate_crop(crop)
+            # Score the natural crop before enhancement; OCR still receives the enhanced crop.
+            rectified_crop = rectify_plate_crop(crop)
+            sharpness_score, crop_size_score, exposure_score = plate_crop_quality_scores(rectified_crop)
+            ocr_crop = enhance_plate_crop_for_ocr(rectified_crop)
             raw_text, ocr_conf = self.ocr.recognize(ocr_crop)
             text = normalize_taiwan_plate_text(raw_text)
+            valid_taiwan_format = is_valid_taiwan_plate(text)
+            crop_quality = plate_recognition_quality_score(
+                detector_score=plate.score,
+                sharpness_score=sharpness_score,
+                crop_size_score=crop_size_score,
+                exposure_score=exposure_score,
+                ocr_confidence=ocr_conf,
+                valid_taiwan_format=valid_taiwan_format,
+            )
             recognitions.append(PlateRecognition(
                 text=text,
                 raw_text=raw_text,
                 confidence=ocr_conf,
                 bbox=plate.bbox,
                 detector_score=plate.score,
-                valid_taiwan_format=is_valid_taiwan_plate(text),
+                valid_taiwan_format=valid_taiwan_format,
                 engine=self.engine_name,
                 debug_crop_bgr=ocr_crop.copy() if ocr_crop is not None else None,
+                crop_quality=crop_quality,
+                sharpness_score=sharpness_score,
+                crop_size_score=crop_size_score,
+                exposure_score=exposure_score,
             ))
         return recognitions
 

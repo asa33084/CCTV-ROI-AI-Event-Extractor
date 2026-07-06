@@ -108,6 +108,9 @@ def plate_recognitions_match(left, right):
 
 
 def plate_recognition_quality(item):
+    crop_quality = float(getattr(item, "crop_quality", 0.0) or 0.0)
+    if crop_quality > 0:
+        return crop_quality
     valid_bonus = 1.0 if item.valid_taiwan_format else 0.0
     return valid_bonus + float(item.confidence or 0.0) + (float(item.detector_score or 0.0) * 0.1)
 

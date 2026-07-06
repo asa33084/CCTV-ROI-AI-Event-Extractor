@@ -19,21 +19,15 @@ from cctv_roi_ai_event_extractor.compute import (
 )
 from cctv_roi_ai_event_extractor.video_stream import VideoStreamServer
 from cctv_roi_ai_event_extractor.vision_utils import (
-    SimpleIouTracker,
-    bbox_area,
     bbox_intersects_mask,
     bbox_iou,
     build_screenshot_frame,
-    crop_bbox_from_frame,
-    draw_anchor_point,
-    draw_detection,
     draw_polygon_overlay,
     get_bottom_center,
     is_vehicle_detection,
     make_polygon_mask,
     plate_recognition_quality,
     plate_recognitions_match,
-    plate_text_distance,
     plate_texts_similar,
     point_in_polygon,
     polygon_bbox,
@@ -278,6 +272,42 @@ def save_frame(out_dir, base_name, t_sec, frame_idx, frame_bgr):
     return False, out_path
 
 
+def _safe_filename_token(value) -> str:
+    text = str(value or "").strip()
+    text = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
+    return text[:80] or "plate"
+
+
+def save_plate_crop_images(out_dir, base_name, t_sec, frame_idx, plate_recognitions):
+    """Persist OCR-ready plate crops and return paths in recognition order."""
+    crop_dir = os.path.join(out_dir, "plate_crops")
+    paths = []
+    for index, item in enumerate(plate_recognitions or [], start=1):
+        crop = getattr(item, "debug_crop_bgr", None)
+        if crop is None or getattr(crop, "size", 0) == 0:
+            paths.append("")
+            continue
+        ensure_dir(crop_dir)
+        plate_text = _safe_filename_token(getattr(item, "text", "") or getattr(item, "raw_text", ""))
+        out_name = f"{base_name}__t{t_sec:010.2f}s__f{frame_idx:09d}__plate{index:02d}__{plate_text}.jpg"
+        out_path = os.path.abspath(os.path.join(crop_dir, out_name))
+        try:
+            ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
+            if ok:
+                with open(out_path, "wb") as f:
+                    f.write(buf.tobytes())
+                paths.append(out_path if os.path.exists(out_path) and os.path.getsize(out_path) > 0 else "")
+                continue
+        except Exception:
+            pass
+        try:
+            ok = cv2.imwrite(out_path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
+            paths.append(out_path if ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0 else "")
+        except Exception:
+            paths.append("")
+    return paths
+
+
 # ---------------------------
 # 安全讀取影片資訊
 # ---------------------------
@@ -472,7 +502,7 @@ def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, fra
         polygon=polygon,
         polygon_np=polygon_np,
         draw_roi_on_screenshot=draw_roi_on_screenshot,
-        plate_recognitions=[] if record_type == "lpr_touch" else plate_recognitions,
+        plate_recognitions=plate_recognitions,
         touch_polygon=touch_polygon,
     )
 
@@ -482,6 +512,13 @@ def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, fra
         current_time_sec,
         frame_idx,
         screenshot_frame
+    )
+    plate_crop_paths = save_plate_crop_images(
+        screenshot_out_dir,
+        base_name,
+        current_time_sec,
+        frame_idx,
+        plate_recognitions,
     )
 
     logs.append({
@@ -496,6 +533,8 @@ def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, fra
         "plate_raw_text": ";".join(item.raw_text for item in plate_recognitions if item.raw_text),
         "plate_confidence": ";".join(f"{item.confidence:.3f}" for item in plate_recognitions),
         "plate_bbox": ";".join(",".join(str(v) for v in item.bbox) for item in plate_recognitions),
+        "plate_crop_path": ";".join(path for path in plate_crop_paths if path),
+        "plate_crop_quality": ";".join(f"{getattr(item, 'crop_quality', 0.0):.3f}" for item in plate_recognitions),
         "plate_valid_taiwan_format": ";".join("Y" if item.valid_taiwan_format else "N" for item in plate_recognitions),
         "plate_ocr_engine": lpr_pipeline.engine_name if lpr_pipeline is not None else "",
     })
@@ -505,6 +544,16 @@ def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, fra
 # ---------------------------
 # 輸出單一片段（原始影片，不畫框）
 # ---------------------------
+def _remove_file_quietly(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def export_interval_clip(
     video_path: str,
     clip_out_dir: str,
@@ -512,7 +561,8 @@ def export_interval_clip(
     start_t: float,
     end_t: float,
     clip_index: int,
-    status_cb=None
+    status_cb=None,
+    stop_checker=None,
 ):
     """Export a raw video segment for a detected event interval."""
     cap = cv2.VideoCapture(video_path)
@@ -573,12 +623,27 @@ def export_interval_clip(
     wrote_any = False
 
     while current < end_frame_exclusive:
+        if stop_checker and stop_checker():
+            writer.release()
+            cap.release()
+            _remove_file_quietly(out_path)
+            if status_cb:
+                status_cb(f"[STOP] 片段輸出中止：{out_name}")
+            return False, None
+
         ok, frame = cap.read()
         if not ok or frame is None:
             break
         writer.write(frame)
         wrote_any = True
         current += 1
+        if stop_checker and current % 10 == 0 and stop_checker():
+            writer.release()
+            cap.release()
+            _remove_file_quietly(out_path)
+            if status_cb:
+                status_cb(f"[STOP] 片段輸出中止：{out_name}")
+            return False, None
 
     writer.release()
     cap.release()
@@ -652,6 +717,8 @@ def _empty_log_row(record_type, video_rel_path="", status="OK"):
         "plate_raw_text": "",
         "plate_confidence": "",
         "plate_bbox": "",
+        "plate_crop_path": "",
+        "plate_crop_quality": "",
         "plate_valid_taiwan_format": "",
         "plate_ocr_engine": "",
     }
@@ -736,6 +803,24 @@ def process_video_stream(
     success_segments = 0
     clip_index = 0
 
+    def stopped_stream_result(message: str):
+        if status_cb:
+            status_cb(message)
+        return {
+            "status": "STOPPED",
+            "grabbed_count": grabbed_count,
+            "clip_count": clip_count,
+            "fps": 0,
+            "width": 0,
+            "height": 0,
+            "frames": total_frames,
+            "logs": logs,
+            "total_videos": len(stream.segments),
+            "success_count": success_segments,
+            "skipped_count": skipped_segments,
+            "stopped_count": 1,
+        }
+
     for video_stream in stream.iter_streams():
         camera_id = video_stream.camera_id
         stream_id = video_stream.stream_id
@@ -752,22 +837,7 @@ def process_video_stream(
         current_segment = None
         for stream_item in stream.frames_for_stream(video_stream):
             if stop_checker and stop_checker():
-                if status_cb:
-                    status_cb("[STOP] 已停止 stream 處理")
-                return {
-                    "status": "STOPPED",
-                    "grabbed_count": grabbed_count,
-                    "clip_count": clip_count,
-                    "fps": 0,
-                    "width": 0,
-                    "height": 0,
-                    "frames": total_frames,
-                    "logs": logs,
-                    "total_videos": len(stream.segments),
-                    "success_count": success_segments,
-                    "skipped_count": skipped_segments,
-                    "stopped_count": 1,
-                }
+                return stopped_stream_result("[STOP] 已停止 stream 處理")
 
             if stream_item.segment != current_segment:
                 current_segment = stream_item.segment
@@ -786,6 +856,8 @@ def process_video_stream(
                 continue
 
             detections = detector.track(stream_item.frame, persist=True)
+            if stop_checker and stop_checker():
+                return stopped_stream_result("[STOP] 已停止 stream tracking")
             if detection_mask is None or detection_mask.shape[:2] != stream_item.frame.shape[:2]:
                 detection_mask = make_polygon_mask(stream_item.frame.shape, polygon)
             # Track summaries are based on vehicles whose box intersects the detection ROI.
@@ -834,6 +906,7 @@ def process_video_stream(
                         "video_rel_path": stream_item.segment.rel_path,
                         "best_quality": -1.0,
                         "best_plate": None,
+                        "best_plate_crop_path": "",
                         "best_screenshot_path": "",
                     }
                     records[key] = record
@@ -851,8 +924,12 @@ def process_video_stream(
                 if lpr_pipeline is None or not should_run_lpr:
                     continue
 
+                if stop_checker and stop_checker():
+                    return stopped_stream_result("[STOP] 已停止 LPR")
                 # LPR is sampled by detect_every_n_frames and only run on the current vehicle crop.
                 recognitions = [item for item in lpr_pipeline.recognize(stream_item.frame, vehicle_detections=[det]) if item.text]
+                if stop_checker and stop_checker():
+                    return stopped_stream_result("[STOP] 已停止 LPR")
                 if not recognitions:
                     continue
                 recognition = max(recognitions, key=plate_recognition_quality)
@@ -869,6 +946,14 @@ def process_video_stream(
                     screenshot_out_dir = os.path.join(screenshots_root, rel_dir)
                     ensure_dir(screenshot_out_dir)
                     base_name = os.path.splitext(os.path.basename(stream_item.segment.path))[0]
+                    crop_paths = save_plate_crop_images(
+                        screenshot_out_dir,
+                        base_name,
+                        stream_item.source_time_sec,
+                        stream_item.local_frame_idx,
+                        [recognition],
+                    )
+                    record["best_plate_crop_path"] = next((path for path in crop_paths if path), "")
                     screenshot_frame = build_screenshot_frame(
                         frame=stream_item.frame,
                         detections=detections,
@@ -887,6 +972,18 @@ def process_video_stream(
                     if ok_save:
                         grabbed_count += 1
                         record["best_screenshot_path"] = shot_path
+                else:
+                    rel_dir = os.path.dirname(stream_item.segment.rel_path)
+                    screenshot_out_dir = os.path.join(screenshots_root, rel_dir)
+                    base_name = os.path.splitext(os.path.basename(stream_item.segment.path))[0]
+                    crop_paths = save_plate_crop_images(
+                        screenshot_out_dir,
+                        base_name,
+                        stream_item.source_time_sec,
+                        stream_item.local_frame_idx,
+                        [recognition],
+                    )
+                    record["best_plate_crop_path"] = next((path for path in crop_paths if path), "")
 
                 if status_cb:
                     status_cb(
@@ -895,6 +992,8 @@ def process_video_stream(
                     )
 
             if debug_stream_preview and not debug_preview_closed:
+                if stop_checker and stop_checker():
+                    return stopped_stream_result("[STOP] 已停止 debug 預覽")
                 try:
                     debug_frame = _build_stream_debug_frame(
                         stream_item,
@@ -913,6 +1012,8 @@ def process_video_stream(
         success_segments += len(segments)
 
         for record in records.values():
+            if stop_checker and stop_checker():
+                return stopped_stream_result("[STOP] 已停止 track summary 輸出")
             # Emit exactly one summary row per completed/active track at camera end.
             if not _is_reportable_stream_track(record):
                 plate = record.get("best_plate")
@@ -947,6 +1048,8 @@ def process_video_stream(
                     "plate_raw_text": plate.raw_text,
                     "plate_confidence": f"{plate.confidence:.3f}",
                     "plate_bbox": ",".join(str(v) for v in plate.bbox),
+                    "plate_crop_path": record.get("best_plate_crop_path", ""),
+                    "plate_crop_quality": f"{getattr(plate, 'crop_quality', 0.0):.3f}",
                     "plate_valid_taiwan_format": "Y" if plate.valid_taiwan_format else "N",
                     "plate_ocr_engine": lpr_pipeline.engine_name if lpr_pipeline is not None else "",
                 })
@@ -975,7 +1078,10 @@ def process_video_stream(
                         end_t=clip_end_t,
                         clip_index=clip_index,
                         status_cb=status_cb,
+                        stop_checker=stop_checker,
                     )
+                    if stop_checker and stop_checker():
+                        return stopped_stream_result("[STOP] 已停止 track summary 片段輸出")
                     if ok_clip:
                         clip_count += 1
                         if not row.get("output_path"):
@@ -1098,8 +1204,6 @@ def process_video(
     event_intervals = []
     polygon_np = np.array(polygon, dtype=np.int32)
     detection_mask = None
-    touch_mask = None
-    use_touch_lpr = False
 
     in_event = False
     event_center_frame = None
@@ -1110,9 +1214,6 @@ def process_video(
     cached_inside_present = False
     cached_inside_vehicle_detections = []
     next_long_stay_shot_frame = None
-    tracker = SimpleIouTracker(max_missed=max(4, start_trigger_frames * 2)) if use_touch_lpr else None
-    vehicle_candidates = {}
-    lpr_completed_track_ids = set()
     use_detection_roi_lpr = lpr_pipeline is not None
     lpr_pending_groups = []
     lpr_suppressed_until = {}
@@ -1129,6 +1230,22 @@ def process_video(
             post_event_sec,
             total_sec,
         ))
+
+    def stopped_video_result(message: str, release_capture: bool = True):
+        if release_capture:
+            cap.release()
+        if status_cb:
+            status_cb(message)
+        return {
+            "status": "STOPPED",
+            "grabbed_count": grabbed_count,
+            "clip_count": clip_count,
+            "fps": fps,
+            "width": frame_w,
+            "height": frame_h,
+            "frames": total,
+            "logs": logs,
+        }
 
     def flush_lpr_group(group):
         """Commit the best candidate in a pending LPR group to logs/screenshots."""
@@ -1161,6 +1278,13 @@ def process_video(
             if ok_save:
                 grabbed_count += 1
         else:
+            crop_paths = save_plate_crop_images(
+                screenshot_out_dir,
+                base_name,
+                record["time_sec"],
+                record["frame_idx"],
+                [recognition],
+            )
             logs.append({
                 "type": "lpr_detection",
                 "video_rel_path": rel_video_path,
@@ -1173,6 +1297,8 @@ def process_video(
                 "plate_raw_text": recognition.raw_text,
                 "plate_confidence": f"{recognition.confidence:.3f}",
                 "plate_bbox": ",".join(str(v) for v in recognition.bbox),
+                "plate_crop_path": next((path for path in crop_paths if path), ""),
+                "plate_crop_quality": f"{getattr(recognition, 'crop_quality', 0.0):.3f}",
                 "plate_valid_taiwan_format": "Y" if recognition.valid_taiwan_format else "N",
                 "plate_ocr_engine": lpr_pipeline.engine_name,
             })
@@ -1291,19 +1417,7 @@ def process_video(
 
     while True:
         if stop_checker and stop_checker():
-            cap.release()
-            if status_cb:
-                status_cb(f"[STOP] 已停止：{rel_video_path}")
-            return {
-                "status": "STOPPED",
-                "grabbed_count": grabbed_count,
-                "clip_count": clip_count,
-                "fps": fps,
-                "width": frame_w,
-                "height": frame_h,
-                "frames": total,
-                "logs": logs
-            }
+            return stopped_video_result(f"[STOP] 已停止：{rel_video_path}")
 
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -1323,25 +1437,11 @@ def process_video(
 
         if should_detect:
             raw_detections = detector.detect(frame)
+            if stop_checker and stop_checker():
+                return stopped_video_result(f"[STOP] 已停止偵測：{rel_video_path}")
             if use_detection_roi_lpr and detection_mask is None:
                 detection_mask = make_polygon_mask(frame.shape, polygon)
-            if use_touch_lpr:
-                vehicle_detections = [
-                    det for det in raw_detections
-                    if det["class_name"] in {"car", "motorcycle", "bus", "truck"}
-                ]
-                tracked_vehicles = tracker.update(vehicle_detections)
-                tracked_by_bbox = {det["bbox"]: det for det in tracked_vehicles}
-                active_track_ids = set(tracker.tracks)
-                for stale_track_id in list(vehicle_candidates):
-                    if stale_track_id not in active_track_ids:
-                        vehicle_candidates.pop(stale_track_id, None)
-                cached_detections = []
-                for det in raw_detections:
-                    tracked = tracked_by_bbox.get(det["bbox"])
-                    cached_detections.append(tracked if tracked is not None else det)
-            else:
-                cached_detections = raw_detections
+            cached_detections = raw_detections
 
             inside_count = 0
             cached_inside_vehicle_detections = []
@@ -1355,24 +1455,6 @@ def process_video(
                 anchor = get_bottom_center(det["bbox"])
                 if point_in_polygon(anchor, polygon_np):
                     inside_count += 1
-                    if (
-                        use_touch_lpr
-                        and det.get("track_id") is not None
-                        and det.get("track_id") not in lpr_completed_track_ids
-                    ):
-                        crop = crop_bbox_from_frame(frame, det["bbox"])
-                        if crop is not None:
-                            track_id = det["track_id"]
-                            area = bbox_area(det["bbox"])
-                            current = vehicle_candidates.get(track_id)
-                            if current is None or area > current["area"]:
-                                vehicle_candidates[track_id] = {
-                                    "area": area,
-                                    "frame": crop,
-                                    "bbox": det["bbox"],
-                                    "frame_idx": frame_idx,
-                                    "time_sec": frame_idx / fps,
-                                }
 
             cached_inside_present = (inside_count > 0)
 
@@ -1381,7 +1463,11 @@ def process_video(
         current_time_sec = frame_idx / fps
 
         if should_detect and use_detection_roi_lpr and cached_inside_vehicle_detections:
+            if stop_checker and stop_checker():
+                return stopped_video_result(f"[STOP] 已停止 LPR：{rel_video_path}")
             plate_recognitions = lpr_pipeline.recognize(frame, vehicle_detections=cached_inside_vehicle_detections)
+            if stop_checker and stop_checker():
+                return stopped_video_result(f"[STOP] 已停止 LPR：{rel_video_path}")
             recognized_plate_recognitions = [item for item in plate_recognitions if item.text]
             if recognized_plate_recognitions:
                 queue_lpr_recognitions(
@@ -1393,74 +1479,6 @@ def process_video(
                 )
         if use_detection_roi_lpr:
             flush_due_lpr_groups(current_time_sec)
-
-        if should_detect and use_touch_lpr:
-            if touch_mask is None:
-                touch_mask = make_polygon_mask(frame.shape, touch_polygon)
-            for det in detections:
-                track_id = det.get("track_id")
-                if track_id is None or track_id in lpr_completed_track_ids:
-                    continue
-                if det["class_name"] not in {"car", "motorcycle", "bus", "truck"}:
-                    continue
-                if not bbox_intersects_mask(det["bbox"], touch_mask):
-                    continue
-
-                candidate = vehicle_candidates.get(track_id)
-                candidate_frame = candidate["frame"] if candidate is not None else crop_bbox_from_frame(frame, det["bbox"])
-                if candidate_frame is None:
-                    lpr_completed_track_ids.add(track_id)
-                    continue
-
-                plate_recognitions = lpr_pipeline.recognize(candidate_frame, vehicle_detections=[det])
-                lpr_completed_track_ids.add(track_id)
-                vehicle_candidates.pop(track_id, None)
-
-                shot_path = ""
-                ok_save = False
-                if export_screenshots:
-                    ok_save, shot_path = try_save_screenshot(
-                        logs=logs,
-                        screenshot_out_dir=screenshot_out_dir,
-                        base_name=base_name,
-                        rel_video_path=rel_video_path,
-                        frame_idx=frame_idx,
-                        current_time_sec=current_time_sec,
-                        frame=frame,
-                        detections=detections,
-                        polygon=polygon,
-                        polygon_np=polygon_np,
-                        draw_roi_on_screenshot=draw_roi_on_screenshot,
-                        lpr_pipeline=None,
-                        touch_polygon=touch_polygon,
-                        record_type="lpr_touch",
-                        plate_recognitions_override=plate_recognitions,
-                    )
-                    if ok_save:
-                        grabbed_count += 1
-                else:
-                    logs.append({
-                        "type": "lpr_touch",
-                        "video_rel_path": rel_video_path,
-                        "event_time_sec": f"{current_time_sec:.2f}",
-                        "interval_start_sec": "",
-                        "interval_end_sec": "",
-                        "output_path": "",
-                        "status": "OK",
-                        "plate_text": ";".join(item.text for item in plate_recognitions if item.text),
-                        "plate_raw_text": ";".join(item.raw_text for item in plate_recognitions if item.raw_text),
-                        "plate_confidence": ";".join(f"{item.confidence:.3f}" for item in plate_recognitions),
-                        "plate_bbox": ";".join(",".join(str(v) for v in item.bbox) for item in plate_recognitions),
-                        "plate_valid_taiwan_format": ";".join("Y" if item.valid_taiwan_format else "N" for item in plate_recognitions),
-                        "plate_ocr_engine": lpr_pipeline.engine_name,
-                    })
-
-                if status_cb:
-                    plate_text = ";".join(item.text for item in plate_recognitions if item.text) or "未辨識"
-                    if export_screenshots and ok_save:
-                        status_cb(f"[LPR] track #{track_id} 觸碰區觸發：{plate_text} | {os.path.basename(shot_path)}")
-                    else:
-                        status_cb(f"[LPR] track #{track_id} 觸碰區觸發：{plate_text}")
 
         # ---------------------------------
         # 只有在真正偵測幀，才更新事件狀態
@@ -1506,7 +1524,7 @@ def process_video(
                             polygon_np=polygon_np,
                             draw_roi_on_screenshot=draw_roi_on_screenshot,
                             lpr_pipeline=None if use_detection_roi_lpr else lpr_pipeline,
-                            touch_polygon=touch_polygon if use_touch_lpr else None,
+                            touch_polygon=None,
                         )
                         if ok_save:
                             grabbed_count += 1
@@ -1548,7 +1566,7 @@ def process_video(
                             polygon_np=polygon_np,
                             draw_roi_on_screenshot=draw_roi_on_screenshot,
                             lpr_pipeline=None if use_detection_roi_lpr else lpr_pipeline,
-                            touch_polygon=touch_polygon if use_touch_lpr else None,
+                            touch_polygon=None,
                         )
                         if ok_save:
                             grabbed_count += 1
@@ -1591,18 +1609,7 @@ def process_video(
 
         for idx, (event_time_sec, start_t, end_t) in enumerate(event_intervals, start=1):
             if stop_checker and stop_checker():
-                if status_cb:
-                    status_cb(f"[STOP] 片段輸出中止：{rel_video_path}")
-                return {
-                    "status": "STOPPED",
-                    "grabbed_count": grabbed_count,
-                    "clip_count": clip_count,
-                    "fps": fps,
-                    "width": frame_w,
-                    "height": frame_h,
-                    "frames": total,
-                    "logs": logs
-                }
+                return stopped_video_result(f"[STOP] 片段輸出中止：{rel_video_path}", release_capture=False)
 
             ok_clip, clip_path = export_interval_clip(
                 video_path=video_path,
@@ -1611,8 +1618,11 @@ def process_video(
                 start_t=start_t,
                 end_t=end_t,
                 clip_index=idx,
-                status_cb=status_cb
+                status_cb=status_cb,
+                stop_checker=stop_checker,
             )
+            if stop_checker and stop_checker():
+                return stopped_video_result(f"[STOP] 片段輸出中止：{rel_video_path}", release_capture=False)
             if ok_clip:
                 clip_count += 1
                 logs.append({

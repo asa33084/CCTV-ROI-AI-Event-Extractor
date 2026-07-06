@@ -69,6 +69,7 @@ from cctv_roi_ai_event_extractor.evidence_report import write_evidence_workbook
 LPR_OCR_CHOICES = (
     ("PaddleOCR（PP-OCRv5）", "paddleocr"),
     ("SVTR / ONNX", "svtr"),
+    ("YOLO26x 車牌號碼", "plate_number_yolo26x"),
     ("Tesseract OCR", "tesseract"),
 )
 
@@ -78,6 +79,8 @@ def normalize_selectable_lpr_ocr_engine(engine_name: str | None) -> str:
     name = (engine_name or "").strip().lower()
     if name in {"svtr", "transformer"}:
         return "svtr"
+    if name in {"plate_number_yolo26x", "yolo26x", "yolo_ocr", "yolo-char", "yolo_char"}:
+        return "plate_number_yolo26x"
     if name in {"tesseract", "pytesseract"}:
         return "tesseract"
     return "paddleocr"
@@ -111,6 +114,8 @@ def write_csv_log(logs_root: str, rows):
                 "plate_raw_text",
                 "plate_confidence",
                 "plate_bbox",
+                "plate_crop_path",
+                "plate_crop_quality",
                 "plate_valid_taiwan_format",
                 "plate_ocr_engine",
             ],
@@ -551,6 +556,8 @@ class BatchWorker(QObject):
                     "plate_raw_text": item.get("plate_raw_text", ""),
                     "plate_confidence": item.get("plate_confidence", ""),
                     "plate_bbox": item.get("plate_bbox", ""),
+                    "plate_crop_path": item.get("plate_crop_path", ""),
+                    "plate_crop_quality": item.get("plate_crop_quality", ""),
                     "plate_valid_taiwan_format": item.get("plate_valid_taiwan_format", ""),
                     "plate_ocr_engine": item.get("plate_ocr_engine", ""),
                 })
@@ -824,7 +831,7 @@ class MainWindow(QMainWindow):
             "Polygon ROI 操作：左鍵加點、右鍵刪點、清空、確認。\n"
             "邏輯說明：偵測區控制事件起訖；啟用車牌辨識時，會對偵測區內的所有車輛執行 LPR，不依賴觸碰區或連續追蹤。\n"
             "加速版：偵測前自動縮圖，可設定每幾幀偵測一次；事件片段以事件時間點為中心輸出原始影片。"
-            "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可選 PaddleOCR、SVTR / ONNX 或 Tesseract。"
+            "\n車牌辨識：需設定 CCTV_ROI_LPR_PLATE_MODEL_PATH；OCR 可選 PaddleOCR、SVTR / ONNX、YOLO26x 車牌號碼或 Tesseract。"
         )
         layout.addWidget(help_text)
 
@@ -1149,6 +1156,7 @@ class MainWindow(QMainWindow):
     def request_stop(self):
         if self.worker is not None:
             self.worker.request_stop()
+            self.btn_stop.setEnabled(False)
             self.set_status("已要求停止（將盡快於影片處理中止）")
 
     def ask_all_params(self):
