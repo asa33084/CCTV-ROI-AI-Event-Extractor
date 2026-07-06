@@ -224,7 +224,7 @@ $env:YOLO_CONFIG_DIR="C:\cctv-roi-runtime\.runtime\ultralytics"
 速度相關設定：
 
 ```powershell
-$env:CCTV_ROI_YOLO_HALF="auto"      # auto 會在 CUDA 裝置上使用 FP16
+$env:CCTV_ROI_YOLO_HALF="false"     # true 會使用 Ultralytics 舊式 half 參數；新版本可能顯示 deprecation warning
 $env:CCTV_ROI_YOLO_FUSE="true"      # 載入模型後嘗試 fuse Conv/BN
 $env:CCTV_ROI_YOLO_IMGSZ="640"      # 留空使用 Ultralytics 預設；調低可加速但可能降低小物件準確度
 $env:CCTV_ROI_TORCH_THREADS="8"     # CPU 推論或前後處理用；留空交給 PyTorch

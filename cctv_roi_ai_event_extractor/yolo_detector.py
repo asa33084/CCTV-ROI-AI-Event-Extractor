@@ -33,7 +33,7 @@ def _is_cuda_device(device: str | None) -> bool:
 def _resolve_yolo_half(device: str | None) -> bool:
     value = os.getenv("CCTV_ROI_YOLO_HALF")
     if value is None or value.strip().lower() in {"", "auto"}:
-        return _is_cuda_device(device)
+        return False
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
@@ -109,6 +109,8 @@ class ObjectDetector:
             "device": self.device,
         }
         if self.half and _is_cuda_device(self.device):
+            # Ultralytics warns that the `half` predict argument is deprecated.
+            # Keep it opt-in for existing deployments that explicitly want FP16.
             kwargs["half"] = True
         if self.imgsz:
             kwargs["imgsz"] = self.imgsz
