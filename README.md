@@ -229,9 +229,12 @@ $env:CCTV_ROI_YOLO_FUSE="true"      # 載入模型後嘗試 fuse Conv/BN
 $env:CCTV_ROI_YOLO_IMGSZ="640"      # 留空使用 Ultralytics 預設；調低可加速但可能降低小物件準確度
 $env:CCTV_ROI_TORCH_THREADS="8"     # CPU 推論或前後處理用；留空交給 PyTorch
 $env:CCTV_ROI_OPENCV_THREADS="8"    # 影片解碼/縮圖用；留空交給 OpenCV
+$env:CCTV_ROI_STREAM_WORKERS="1"    # >1 時依 camera 平行處理 stream；debug 預覽 frame 會從 worker 回傳
 ```
 
 GUI 的「每幾幀偵測一次」在 stream track 流程會同時控制 YOLO track 頻率；數值越大越快，但 track 起訖時間與短暫出現車輛會更粗略。
+
+`CCTV_ROI_STREAM_WORKERS` 會讓不同 camera 在不同 process 中各自載入 YOLO / LPR 模型並保持同 camera 內的 track 時序。CPU 模式建議先從 `2` 開始測；若同時設定 `CCTV_ROI_TORCH_THREADS` / `CCTV_ROI_OPENCV_THREADS`，每個 worker 都會套用這些 thread 數，總量過高可能造成 CPU oversubscription。Debug track 預覽也可在 parallel 模式下使用，但影格需要跨 process 傳回 Qt，開啟時會有額外 IPC 負擔。
 
 車牌辨識可用設定：
 

@@ -1,4 +1,5 @@
 import csv
+import multiprocessing as mp
 import os
 import sys
 from datetime import datetime
@@ -58,6 +59,7 @@ from cctv_roi_ai_event_extractor.core import (
     polygon_bbox,
     process_video,
     process_video_stream,
+    process_video_stream_parallel,
     resolve_default_model_path,
     safe_relpath,
     save_roi_regions,
@@ -159,14 +161,71 @@ class DebugStreamPreviewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("CCTV Stream YOLO Track Debug")
         self.resize(960, 540)
+        self.frames_by_stream = {}
+        self.labels_by_stream = {}
 
         layout = QVBoxLayout(self)
+        self.stream_combo = QComboBox()
+        self.stream_combo.currentIndexChanged.connect(self.on_stream_changed)
+        layout.addWidget(self.stream_combo)
         self.label = QLabel("等待 debug frame...")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setMinimumSize(640, 360)
         layout.addWidget(self.label)
 
-    def update_frame(self, frame_bgr):
+    def update_frame(self, payload):
+        if isinstance(payload, dict):
+            if payload.get("type") == "stream_list":
+                self.update_stream_list(payload.get("streams") or [])
+                return
+            frame_bgr = payload.get("frame")
+            stream_key = payload.get("stream_key") or "stream"
+            stream_label = payload.get("stream_label") or stream_key
+        else:
+            frame_bgr = payload
+            stream_key = "stream"
+            stream_label = "stream"
+        if frame_bgr is None:
+            return
+
+        self.frames_by_stream[stream_key] = frame_bgr
+        self.labels_by_stream[stream_key] = stream_label
+        existing_index = self.stream_combo.findData(stream_key)
+        if existing_index < 0:
+            self.stream_combo.addItem(stream_label, stream_key)
+        else:
+            self.stream_combo.setItemText(existing_index, stream_label)
+        if self.stream_combo.currentData() in (None, stream_key):
+            index = self.stream_combo.findData(stream_key)
+            if index >= 0 and self.stream_combo.currentIndex() != index:
+                self.stream_combo.setCurrentIndex(index)
+            self._show_frame(frame_bgr)
+
+    def update_stream_list(self, streams):
+        for item in streams:
+            stream_key = item.get("stream_key")
+            if not stream_key:
+                continue
+            stream_label = item.get("stream_label") or stream_key
+            self.labels_by_stream[stream_key] = stream_label
+            existing_index = self.stream_combo.findData(stream_key)
+            if existing_index < 0:
+                self.stream_combo.addItem(stream_label, stream_key)
+            else:
+                self.stream_combo.setItemText(existing_index, stream_label)
+        if self.stream_combo.currentIndex() < 0 and self.stream_combo.count() > 0:
+            self.stream_combo.setCurrentIndex(0)
+
+    def on_stream_changed(self):
+        stream_key = self.stream_combo.currentData()
+        frame_bgr = self.frames_by_stream.get(stream_key)
+        if frame_bgr is not None:
+            self._show_frame(frame_bgr)
+            return
+        label = self.labels_by_stream.get(stream_key, stream_key or "")
+        self.label.setText(f"等待 debug frame...\n{label}")
+
+    def _show_frame(self, frame_bgr):
         pixmap = cv_to_qpixmap(frame_bgr)
         target = self.label.size()
         if target.width() > 0 and target.height() > 0:
@@ -507,31 +566,64 @@ class BatchWorker(QObject):
             csv_rows = []
 
             self.video_progress.emit(0, total_videos)
+            stream_workers = 1
+            try:
+                stream_workers = max(1, int(os.getenv("CCTV_ROI_STREAM_WORKERS", "1")))
+            except ValueError:
+                stream_workers = 1
+            use_parallel_streams = stream_workers > 1
 
-            result = process_video_stream(
-                video_paths=videos,
-                input_dir=self.config["input_dir"],
-                screenshots_root=self.config["screenshots_root"],
-                clips_root=self.config["clips_root"],
-                polygon=self.config["polygon"],
-                detector=self.config["detector"],
-                start_trigger_frames=self.config["start_trigger_frames"],
-                end_hold_sec=self.config["end_hold_sec"],
-                pre_event_sec=self.config["pre_event_sec"],
-                post_event_sec=self.config["post_event_sec"],
-                draw_roi_on_screenshot=self.config["draw_roi_on_screenshot"],
-                export_screenshots=self.config["export_screenshots"],
-                export_clips=self.config["export_clips"],
-                detect_every_n_frames=self.config["detect_every_n_frames"],
-                lpr_pipeline=self.config.get("lpr_pipeline"),
-                touch_polygon=self.config.get("touch_polygon"),
-                export_long_stay_screenshots=self.config.get("export_long_stay_screenshots", True),
-                debug_stream_preview=self.config.get("debug_stream_preview", False),
-                debug_frame_cb=self.debug_frame_ready.emit,
-                progress_cb=lambda frame_idx, total_frames: self.frame_progress.emit(frame_idx, total_frames),
-                status_cb=self.status_changed.emit,
-                stop_checker=lambda: self.stop_requested,
-            )
+            if use_parallel_streams:
+                result = process_video_stream_parallel(
+                    video_paths=videos,
+                    input_dir=self.config["input_dir"],
+                    screenshots_root=self.config["screenshots_root"],
+                    clips_root=self.config["clips_root"],
+                    polygon=self.config["polygon"],
+                    detector_config=self.config["detector_config"],
+                    start_trigger_frames=self.config["start_trigger_frames"],
+                    end_hold_sec=self.config["end_hold_sec"],
+                    pre_event_sec=self.config["pre_event_sec"],
+                    post_event_sec=self.config["post_event_sec"],
+                    draw_roi_on_screenshot=self.config["draw_roi_on_screenshot"],
+                    export_screenshots=self.config["export_screenshots"],
+                    export_clips=self.config["export_clips"],
+                    detect_every_n_frames=self.config["detect_every_n_frames"],
+                    lpr_config=self.config.get("lpr_config"),
+                    touch_polygon=self.config.get("touch_polygon"),
+                    export_long_stay_screenshots=self.config.get("export_long_stay_screenshots", True),
+                    worker_count=stream_workers,
+                    debug_stream_preview=self.config.get("debug_stream_preview", False),
+                    debug_frame_cb=self.debug_frame_ready.emit,
+                    progress_cb=lambda frame_idx, total_frames: self.frame_progress.emit(frame_idx, total_frames),
+                    status_cb=self.status_changed.emit,
+                    stop_checker=lambda: self.stop_requested,
+                )
+            else:
+                result = process_video_stream(
+                    video_paths=videos,
+                    input_dir=self.config["input_dir"],
+                    screenshots_root=self.config["screenshots_root"],
+                    clips_root=self.config["clips_root"],
+                    polygon=self.config["polygon"],
+                    detector=self.config["detector"],
+                    start_trigger_frames=self.config["start_trigger_frames"],
+                    end_hold_sec=self.config["end_hold_sec"],
+                    pre_event_sec=self.config["pre_event_sec"],
+                    post_event_sec=self.config["post_event_sec"],
+                    draw_roi_on_screenshot=self.config["draw_roi_on_screenshot"],
+                    export_screenshots=self.config["export_screenshots"],
+                    export_clips=self.config["export_clips"],
+                    detect_every_n_frames=self.config["detect_every_n_frames"],
+                    lpr_pipeline=self.config.get("lpr_pipeline"),
+                    touch_polygon=self.config.get("touch_polygon"),
+                    export_long_stay_screenshots=self.config.get("export_long_stay_screenshots", True),
+                    debug_stream_preview=self.config.get("debug_stream_preview", False),
+                    debug_frame_cb=self.debug_frame_ready.emit,
+                    progress_cb=lambda frame_idx, total_frames: self.frame_progress.emit(frame_idx, total_frames),
+                    status_cb=self.status_changed.emit,
+                    stop_checker=lambda: self.stop_requested,
+                )
 
             for item in result["logs"]:
                 csv_rows.append({
@@ -1346,6 +1438,13 @@ class MainWindow(QMainWindow):
             "polygon": self.polygon,
             "touch_polygon": self.touch_polygon,
             "detector": self.detector,
+            "detector_config": {
+                "model_path": self.model_path,
+                "conf": self.confidence,
+                "detect_width": self.detect_width,
+                "device": self.device,
+                "tracker_path": getattr(self.detector, "tracker_path", None),
+            },
             "start_trigger_frames": self.start_trigger_frames,
             "end_hold_sec": self.end_hold_sec,
             "pre_event_sec": self.pre_event_sec,
@@ -1356,6 +1455,13 @@ class MainWindow(QMainWindow):
             "export_clips": self.chk_export_clips.isChecked(),
             "detect_every_n_frames": self.detect_every_n_frames,
             "lpr_pipeline": self.lpr_pipeline,
+            "lpr_config": {
+                "enabled": self.lpr_pipeline is not None,
+                "plate_model_path": self.lpr_plate_model_path,
+                "ocr_engine": self.lpr_ocr_engine,
+                "conf": self.lpr_confidence,
+                "device": self.device,
+            },
             "debug_stream_preview": self.chk_debug_stream.isChecked(),
         }
 
@@ -1500,6 +1606,7 @@ class MainWindow(QMainWindow):
 
 def main():
     """Launch the Qt GUI application."""
+    mp.freeze_support()
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

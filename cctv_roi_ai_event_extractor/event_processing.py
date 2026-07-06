@@ -1,7 +1,10 @@
 import os
 import json
+import multiprocessing as mp
+import queue
 import shutil
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime
 
 import cv2
@@ -48,6 +51,17 @@ LPR_LOCATION_IOU_THRESHOLD = 0.10
 VEHICLE_TRACK_DUPLICATE_IOU_THRESHOLD = 0.35
 STREAM_TRACK_MIN_SEEN_FRAMES = 8
 STREAM_TRACK_MIN_DURATION_SEC = 0.5
+
+
+def resolve_stream_worker_count(default: int = 1) -> int:
+    """Resolve optional process-level parallelism for independent camera streams."""
+    value = os.getenv("CCTV_ROI_STREAM_WORKERS")
+    if not value:
+        return default
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return default
 
 
 # ---------------------------
@@ -745,6 +759,327 @@ def _build_stream_debug_frame(stream_item, detections, polygon, polygon_np, plat
     return debug_frame
 
 
+def _stream_worker_emit(message_queue, kind: str, payload):
+    if message_queue is None:
+        return
+    try:
+        message_queue.put((kind, payload))
+    except Exception:
+        pass
+
+
+def _process_camera_stream_worker(payload):
+    detector_config = payload["detector_config"]
+    lpr_config = payload.get("lpr_config")
+    message_queue = payload.get("message_queue")
+    stop_event = payload.get("stop_event")
+    camera_id = payload.get("camera_id", "")
+
+    def status_cb(message):
+        prefix = f"[{camera_id}] " if camera_id else ""
+        _stream_worker_emit(message_queue, "status", prefix + message)
+
+    def progress_cb(frame_idx, total_frames):
+        _stream_worker_emit(message_queue, "progress", {
+            "camera_id": camera_id,
+            "current": int(frame_idx),
+            "total": int(total_frames),
+        })
+
+    def debug_frame_cb(payload):
+        _stream_worker_emit(message_queue, "debug", payload)
+
+    def stop_checker():
+        try:
+            return bool(stop_event is not None and stop_event.is_set())
+        except Exception:
+            return False
+
+    detector = ObjectDetector(
+        detector_config["model_path"],
+        conf=detector_config["conf"],
+        detect_width=detector_config["detect_width"],
+        device=detector_config["device"],
+        tracker_path=detector_config.get("tracker_path"),
+    )
+
+    lpr_pipeline = None
+    if lpr_config and lpr_config.get("enabled"):
+        from cctv_roi_ai_event_extractor.lpr import LicensePlateRecognizer
+
+        lpr_pipeline = LicensePlateRecognizer(
+            plate_model_path=lpr_config["plate_model_path"],
+            ocr_engine=lpr_config["ocr_engine"],
+            conf=lpr_config["conf"],
+            device=lpr_config["device"],
+        )
+
+    return process_video_stream(
+        video_paths=payload["video_paths"],
+        input_dir=payload["input_dir"],
+        screenshots_root=payload["screenshots_root"],
+        clips_root=payload["clips_root"],
+        polygon=payload["polygon"],
+        detector=detector,
+        start_trigger_frames=payload["start_trigger_frames"],
+        end_hold_sec=payload["end_hold_sec"],
+        pre_event_sec=payload["pre_event_sec"],
+        post_event_sec=payload["post_event_sec"],
+        draw_roi_on_screenshot=payload["draw_roi_on_screenshot"],
+        export_screenshots=payload["export_screenshots"],
+        export_clips=payload["export_clips"],
+        detect_every_n_frames=payload["detect_every_n_frames"],
+        lpr_pipeline=lpr_pipeline,
+        touch_polygon=payload.get("touch_polygon"),
+        export_long_stay_screenshots=payload.get("export_long_stay_screenshots", True),
+        debug_stream_preview=payload.get("debug_stream_preview", False),
+        debug_frame_cb=debug_frame_cb if payload.get("debug_stream_preview", False) else None,
+        progress_cb=progress_cb,
+        status_cb=status_cb,
+        stop_checker=stop_checker,
+    )
+
+
+def _drain_stream_worker_messages(
+    message_queue,
+    status_cb=None,
+    progress_cb=None,
+    camera_progress=None,
+    debug_frame_cb=None,
+):
+    if message_queue is None:
+        return
+    while True:
+        try:
+            kind, payload = message_queue.get_nowait()
+        except queue.Empty:
+            break
+        except Exception:
+            break
+
+        if kind == "status" and status_cb:
+            status_cb(payload)
+        elif kind == "debug" and debug_frame_cb:
+            debug_frame_cb(payload)
+        elif kind == "progress" and progress_cb:
+            camera_id = payload.get("camera_id", "")
+            current = int(payload.get("current", 0) or 0)
+            total = int(payload.get("total", 0) or 0)
+            if camera_progress is not None and camera_id:
+                camera_progress[camera_id] = (current, total)
+                progress_cb(
+                    sum(item[0] for item in camera_progress.values()),
+                    sum(item[1] for item in camera_progress.values()),
+                )
+            else:
+                progress_cb(current, total)
+
+
+def process_video_stream_parallel(
+    video_paths,
+    input_dir: str,
+    screenshots_root: str,
+    clips_root: str,
+    polygon,
+    detector_config: dict,
+    start_trigger_frames: int,
+    end_hold_sec: float,
+    pre_event_sec: float,
+    post_event_sec: float,
+    draw_roi_on_screenshot: bool,
+    export_screenshots: bool,
+    export_clips: bool,
+    detect_every_n_frames: int,
+    lpr_config: dict | None = None,
+    touch_polygon=None,
+    export_long_stay_screenshots: bool = True,
+    worker_count: int | None = None,
+    debug_stream_preview: bool = False,
+    debug_frame_cb=None,
+    progress_cb=None,
+    status_cb=None,
+    stop_checker=None,
+):
+    """Process independent cameras in separate processes and aggregate their stream logs."""
+    worker_count = resolve_stream_worker_count() if worker_count is None else max(1, int(worker_count))
+    stream = VideoStreamServer.from_paths(video_paths, input_dir=input_dir, load_metadata=True)
+    camera_paths = [
+        (camera_id, [segment.path for segment in segments])
+        for camera_id, segments in stream.iter_camera_segments()
+    ]
+
+    if worker_count <= 1 or len(camera_paths) <= 1:
+        detector = ObjectDetector(
+            detector_config["model_path"],
+            conf=detector_config["conf"],
+            detect_width=detector_config["detect_width"],
+            device=detector_config["device"],
+            tracker_path=detector_config.get("tracker_path"),
+        )
+        lpr_pipeline = None
+        if lpr_config and lpr_config.get("enabled"):
+            from cctv_roi_ai_event_extractor.lpr import LicensePlateRecognizer
+
+            lpr_pipeline = LicensePlateRecognizer(
+                plate_model_path=lpr_config["plate_model_path"],
+                ocr_engine=lpr_config["ocr_engine"],
+                conf=lpr_config["conf"],
+                device=lpr_config["device"],
+            )
+        return process_video_stream(
+            video_paths=video_paths,
+            input_dir=input_dir,
+            screenshots_root=screenshots_root,
+            clips_root=clips_root,
+            polygon=polygon,
+            detector=detector,
+            start_trigger_frames=start_trigger_frames,
+            end_hold_sec=end_hold_sec,
+            pre_event_sec=pre_event_sec,
+            post_event_sec=post_event_sec,
+            draw_roi_on_screenshot=draw_roi_on_screenshot,
+            export_screenshots=export_screenshots,
+            export_clips=export_clips,
+            detect_every_n_frames=detect_every_n_frames,
+            lpr_pipeline=lpr_pipeline,
+            touch_polygon=touch_polygon,
+            export_long_stay_screenshots=export_long_stay_screenshots,
+            debug_stream_preview=debug_stream_preview,
+            debug_frame_cb=debug_frame_cb,
+            progress_cb=progress_cb,
+            status_cb=status_cb,
+            stop_checker=stop_checker,
+        )
+
+    worker_count = min(worker_count, len(camera_paths))
+    total_frames = stream.total_frames
+    if status_cb:
+        status_cb(
+            f"[STREAM-PARALLEL] camera workers={worker_count} | cameras={len(camera_paths)} "
+            f"| videos={len(stream.segments)} | frames={total_frames}"
+        )
+        if debug_stream_preview:
+            status_cb("[DEBUG] Stream YOLO track / LPR crop 預覽已啟用；parallel workers 會回傳 debug frame。")
+    if debug_stream_preview and debug_frame_cb is not None:
+        debug_frame_cb({
+            "type": "stream_list",
+            "streams": [
+                {
+                    "stream_key": f"{video_stream.camera_id}:{video_stream.stream_id}",
+                    "stream_label": (
+                        f"{video_stream.camera_id} / {video_stream.stream_id} | "
+                        f"{len(video_stream.segments)} segment(s)"
+                    ),
+                    "camera_id": video_stream.camera_id,
+                    "stream_id": video_stream.stream_id,
+                    "segments": [segment.rel_path for segment in video_stream.segments],
+                }
+                for video_stream in stream.iter_streams()
+            ],
+        })
+
+    logs = []
+    grabbed_count = 0
+    clip_count = 0
+    success_count = 0
+    skipped_count = 0
+    stopped_count = 0
+    camera_progress = {
+        camera_id: (0, sum(max(0, int(segment.frame_count or 0)) for segment in segments))
+        for camera_id, segments in stream.iter_camera_segments()
+    }
+
+    mp_context = mp.get_context("spawn")
+    manager = mp_context.Manager()
+    message_queue = manager.Queue()
+    stop_event = manager.Event()
+
+    base_payload = {
+        "input_dir": input_dir,
+        "screenshots_root": screenshots_root,
+        "clips_root": clips_root,
+        "polygon": polygon,
+        "detector_config": detector_config,
+        "start_trigger_frames": start_trigger_frames,
+        "end_hold_sec": end_hold_sec,
+        "pre_event_sec": pre_event_sec,
+        "post_event_sec": post_event_sec,
+        "draw_roi_on_screenshot": draw_roi_on_screenshot,
+        "export_screenshots": export_screenshots,
+        "export_clips": export_clips,
+        "detect_every_n_frames": detect_every_n_frames,
+        "lpr_config": lpr_config,
+        "touch_polygon": touch_polygon,
+        "export_long_stay_screenshots": export_long_stay_screenshots,
+        "debug_stream_preview": debug_stream_preview,
+        "message_queue": message_queue,
+        "stop_event": stop_event,
+    }
+
+    futures = {}
+    with ProcessPoolExecutor(max_workers=worker_count, mp_context=mp_context) as executor:
+        for camera_id, paths in camera_paths:
+            payload = dict(base_payload)
+            payload["camera_id"] = camera_id
+            payload["video_paths"] = paths
+            futures[executor.submit(_process_camera_stream_worker, payload)] = camera_id
+
+        pending = set(futures)
+        while pending:
+            if stop_checker and stop_checker():
+                stop_event.set()
+            done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+            _drain_stream_worker_messages(message_queue, status_cb, progress_cb, camera_progress, debug_frame_cb)
+            for future in done:
+                camera_id = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    stopped_count += 1
+                    if status_cb:
+                        status_cb(f"[STREAM-PARALLEL-ERROR] camera={camera_id} | {exc}")
+                    continue
+                logs.extend(result.get("logs", []))
+                grabbed_count += int(result.get("grabbed_count", 0) or 0)
+                clip_count += int(result.get("clip_count", 0) or 0)
+                success_count += int(result.get("success_count", 0) or 0)
+                skipped_count += int(result.get("skipped_count", 0) or 0)
+                stopped_count += int(result.get("stopped_count", 0) or 0)
+
+    _drain_stream_worker_messages(message_queue, status_cb, progress_cb, camera_progress, debug_frame_cb)
+    manager.shutdown()
+    logs.sort(key=lambda item: (
+        item.get("camera_id", ""),
+        item.get("stream_id", ""),
+        item.get("track_start_datetime", ""),
+        item.get("video_rel_path", ""),
+        item.get("event_time_sec", ""),
+        item.get("track_id", ""),
+    ))
+    if progress_cb:
+        progress_cb(total_frames, total_frames)
+    if status_cb:
+        status_cb(
+            f"[STREAM-PARALLEL-DONE] tracks={sum(1 for item in logs if item.get('type') == 'track_summary')} "
+            f"screenshots={grabbed_count} clips={clip_count}"
+        )
+
+    return {
+        "status": "STOPPED" if stopped_count else "OK",
+        "grabbed_count": grabbed_count,
+        "clip_count": clip_count,
+        "fps": 0,
+        "width": 0,
+        "height": 0,
+        "frames": total_frames,
+        "logs": logs,
+        "total_videos": len(stream.segments),
+        "success_count": success_count,
+        "skipped_count": skipped_count,
+        "stopped_count": stopped_count,
+    }
+
+
 def process_video_stream(
     video_paths,
     input_dir: str,
@@ -798,6 +1133,23 @@ def process_video_stream(
             status_cb("[STREAM] 事件片段會以 track 進入時間為中心，依前後保留秒數輸出。")
         if debug_stream_preview:
             status_cb("[DEBUG] Stream YOLO track / LPR crop 預覽已啟用；關閉 Qt 預覽視窗可停止顯示。")
+    if debug_stream_preview and debug_frame_cb is not None:
+        debug_frame_cb({
+            "type": "stream_list",
+            "streams": [
+                {
+                    "stream_key": f"{video_stream.camera_id}:{video_stream.stream_id}",
+                    "stream_label": (
+                        f"{video_stream.camera_id} / {video_stream.stream_id} | "
+                        f"{len(video_stream.segments)} segment(s)"
+                    ),
+                    "camera_id": video_stream.camera_id,
+                    "stream_id": video_stream.stream_id,
+                    "segments": [segment.rel_path for segment in video_stream.segments],
+                }
+                for video_stream in stream.iter_streams()
+            ],
+        })
 
     skipped_segments = 0
     success_segments = 0
@@ -1003,7 +1355,18 @@ def process_video_stream(
                         plate_recognitions=debug_plate_recognitions,
                     )
                     if debug_frame_cb is not None:
-                        debug_frame_cb(debug_frame)
+                        debug_frame_cb({
+                            "frame": debug_frame,
+                            "stream_key": f"{camera_id}:{stream_id}",
+                            "stream_label": (
+                                f"{camera_id} / {stream_id} | "
+                                f"{stream_item.segment.rel_path} | frame {stream_item.local_frame_idx}"
+                            ),
+                            "camera_id": camera_id,
+                            "stream_id": stream_id,
+                            "source": stream_item.segment.rel_path,
+                            "frame_idx": stream_item.local_frame_idx,
+                        })
                 except Exception as e:
                     debug_preview_closed = True
                     if status_cb:
