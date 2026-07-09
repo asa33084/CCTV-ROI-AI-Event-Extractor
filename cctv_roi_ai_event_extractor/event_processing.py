@@ -20,7 +20,7 @@ from cctv_roi_ai_event_extractor.compute import (
     get_auto_device_info,
     list_available_compute_devices,
 )
-from cctv_roi_ai_event_extractor.video_stream import VideoStreamServer
+from cctv_roi_ai_event_extractor.video_stream import VideoStreamServer, parse_video_filename
 from cctv_roi_ai_event_extractor.vision_utils import (
     bbox_intersects_mask,
     bbox_iou,
@@ -500,9 +500,18 @@ def find_first_readable_video(video_paths):
 # ---------------------------
 # 截圖與片段輸出
 # ---------------------------
+def _video_file_name(video_rel_path: str) -> str:
+    return os.path.basename(video_rel_path or "")
+
+
+def _camera_name_for_video(video_path: str, rel_video_path: str) -> str:
+    return parse_video_filename(video_path, rel_path=rel_video_path).camera_id
+
+
 def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, frame_idx, current_time_sec,
                         frame, detections, polygon, polygon_np, draw_roi_on_screenshot, lpr_pipeline=None,
-                        touch_polygon=None, record_type="screenshot", plate_recognitions_override=None):
+                        touch_polygon=None, record_type="screenshot", plate_recognitions_override=None,
+                        camera_name=""):
     """Save one screenshot and append the corresponding CSV/log row."""
     plate_recognitions = []
     if plate_recognitions_override is not None:
@@ -538,6 +547,8 @@ def try_save_screenshot(logs, screenshot_out_dir, base_name, rel_video_path, fra
     logs.append({
         "type": record_type,
         "video_rel_path": rel_video_path,
+        "video_file_name": _video_file_name(rel_video_path),
+        "camera_name": camera_name,
         "event_time_sec": f"{current_time_sec:.2f}",
         "interval_start_sec": "",
         "interval_end_sec": "",
@@ -709,10 +720,12 @@ def _is_reportable_stream_track(record):
     return seen_frames >= STREAM_TRACK_MIN_SEEN_FRAMES or duration_sec >= STREAM_TRACK_MIN_DURATION_SEC
 
 
-def _empty_log_row(record_type, video_rel_path="", status="OK"):
+def _empty_log_row(record_type, video_rel_path="", status="OK", camera_name=""):
     return {
         "type": record_type,
         "video_rel_path": video_rel_path,
+        "video_file_name": _video_file_name(video_rel_path),
+        "camera_name": camera_name,
         "event_time_sec": "",
         "interval_start_sec": "",
         "interval_end_sec": "",
@@ -1125,7 +1138,7 @@ def process_video_stream(
         cameras = ", ".join(stream.camera_ids) or "N/A"
         status_cb(
             f"[STREAM] 影片讀取器啟動 | cameras={cameras} | videos={len(stream.segments)} "
-            f"| track_stride={detect_every_n_frames}"
+            f"| track_stride={detect_every_n_frames} | frame_queue={stream.frame_queue_size}"
         )
         if getattr(detector, "tracker_path", None):
             status_cb(f"[TRACKER] {detector.tracker_path}")
@@ -1240,6 +1253,7 @@ def process_video_stream(
                     # New track: store timing, source file, best plate, and best screenshot as it evolves.
                     record = {
                         "camera_id": camera_id,
+                        "camera_name": camera_id,
                         "stream_id": stream_id,
                         "track_id": display_track_id,
                         "raw_track_id": track_id,
@@ -1389,13 +1403,18 @@ def process_video_stream(
                 continue
 
             plate = record.get("best_plate")
-            row = _empty_log_row("track_summary", video_rel_path=record.get("video_rel_path", ""))
+            row = _empty_log_row(
+                "track_summary",
+                video_rel_path=record.get("video_rel_path", ""),
+                camera_name=record.get("camera_name", record.get("camera_id", "")),
+            )
             row.update({
                 "event_time_sec": f'{record.get("start_time_sec", 0.0):.2f}',
                 "interval_start_sec": f'{record.get("start_time_sec", 0.0):.2f}',
                 "interval_end_sec": f'{record.get("end_time_sec", 0.0):.2f}',
                 "output_path": record.get("best_screenshot_path", ""),
                 "camera_id": record["camera_id"],
+                "camera_name": record.get("camera_name", record["camera_id"]),
                 "stream_id": record["stream_id"],
                 "track_id": str(record["track_id"]),
                 "track_start_datetime": _format_datetime(record.get("start_datetime")),
@@ -1543,6 +1562,7 @@ def process_video(
 
     rel_dir = os.path.dirname(rel_video_path)
     base_name = os.path.splitext(os.path.basename(video_path))[0]
+    camera_name = _camera_name_for_video(video_path, rel_video_path)
 
     screenshot_out_dir = os.path.join(screenshots_root, rel_dir)
     clip_out_dir = os.path.join(clips_root, rel_dir)
@@ -1637,6 +1657,7 @@ def process_video(
                 touch_polygon=touch_polygon,
                 record_type="lpr_detection",
                 plate_recognitions_override=[recognition],
+                camera_name=camera_name,
             )
             if ok_save:
                 grabbed_count += 1
@@ -1651,6 +1672,8 @@ def process_video(
             logs.append({
                 "type": "lpr_detection",
                 "video_rel_path": rel_video_path,
+                "video_file_name": _video_file_name(rel_video_path),
+                "camera_name": camera_name,
                 "event_time_sec": f'{record["time_sec"]:.2f}',
                 "interval_start_sec": "",
                 "interval_end_sec": "",
@@ -1888,6 +1911,7 @@ def process_video(
                             draw_roi_on_screenshot=draw_roi_on_screenshot,
                             lpr_pipeline=None if use_detection_roi_lpr else lpr_pipeline,
                             touch_polygon=None,
+                            camera_name=camera_name,
                         )
                         if ok_save:
                             grabbed_count += 1
@@ -1930,6 +1954,7 @@ def process_video(
                             draw_roi_on_screenshot=draw_roi_on_screenshot,
                             lpr_pipeline=None if use_detection_roi_lpr else lpr_pipeline,
                             touch_polygon=None,
+                            camera_name=camera_name,
                         )
                         if ok_save:
                             grabbed_count += 1
@@ -1991,6 +2016,8 @@ def process_video(
                 logs.append({
                     "type": "clip",
                     "video_rel_path": rel_video_path,
+                    "video_file_name": _video_file_name(rel_video_path),
+                    "camera_name": camera_name,
                     "event_time_sec": f"{event_time_sec:.2f}",
                     "interval_start_sec": f"{start_t:.2f}",
                     "interval_end_sec": f"{end_t:.2f}",

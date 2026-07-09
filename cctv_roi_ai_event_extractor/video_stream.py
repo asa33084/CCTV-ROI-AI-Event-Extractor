@@ -1,10 +1,13 @@
 import os
 import re
+import threading
+import queue
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable, Iterator
 
 CONTINUOUS_STREAM_GAP_SEC = 2.0
+DEFAULT_FRAME_QUEUE_SIZE = 0
 
 
 _DATE_TIME_PATTERN = re.compile(
@@ -186,9 +189,15 @@ def build_video_segments(
 class VideoStreamServer:
     """Groups video files by camera and yields gap-free chronological streams."""
 
-    def __init__(self, segments: Iterable[VideoSegment], max_gap_sec: float = CONTINUOUS_STREAM_GAP_SEC):
+    def __init__(
+        self,
+        segments: Iterable[VideoSegment],
+        max_gap_sec: float = CONTINUOUS_STREAM_GAP_SEC,
+        frame_queue_size: int | None = None,
+    ):
         self.segments = list(segments)
         self.max_gap_sec = float(max_gap_sec)
+        self.frame_queue_size = _resolve_frame_queue_size(frame_queue_size)
 
     @classmethod
     def from_paths(
@@ -197,10 +206,12 @@ class VideoStreamServer:
         input_dir: str | None = None,
         load_metadata: bool = True,
         max_gap_sec: float = CONTINUOUS_STREAM_GAP_SEC,
+        frame_queue_size: int | None = None,
     ):
         return cls(
             build_video_segments(video_paths, input_dir=input_dir, load_metadata=load_metadata),
             max_gap_sec=max_gap_sec,
+            frame_queue_size=frame_queue_size,
         )
 
     @property
@@ -246,6 +257,12 @@ class VideoStreamServer:
                 yield _make_video_stream(camera_id, stream_index, current_segments)
 
     def frames_for_stream(self, stream: VideoStream) -> Iterator[StreamFrame]:
+        if self.frame_queue_size > 0:
+            yield from self._frames_for_stream_prefetched(stream)
+            return
+        yield from self._frames_for_stream_direct(stream)
+
+    def _frames_for_stream_direct(self, stream: VideoStream) -> Iterator[StreamFrame]:
         import cv2
 
         # stream_frame_idx resets per continuous stream; local_frame_idx resets per file.
@@ -283,6 +300,49 @@ class VideoStreamServer:
                 cap.release()
             stream_elapsed_sec += _segment_duration_sec(segment)
 
+    def _frames_for_stream_prefetched(self, stream: VideoStream) -> Iterator[StreamFrame]:
+        frame_queue = queue.Queue(maxsize=max(1, int(self.frame_queue_size)))
+        stop_event = threading.Event()
+        sentinel = object()
+        errors = []
+
+        def put_item(item):
+            while not stop_event.is_set():
+                try:
+                    frame_queue.put(item, timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+
+        def producer():
+            try:
+                for stream_frame in self._frames_for_stream_direct(stream):
+                    put_item(stream_frame)
+                    if stop_event.is_set():
+                        break
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                put_item(sentinel)
+
+        thread = threading.Thread(
+            target=producer,
+            name=f"frame-prefetch-{stream.stream_id}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            while True:
+                item = frame_queue.get()
+                if item is sentinel:
+                    break
+                yield item
+            if errors:
+                raise errors[0]
+        finally:
+            stop_event.set()
+            thread.join(timeout=2.0)
+
     def frames_for_camera(self, camera_id: str, segments: Iterable[VideoSegment]) -> Iterator[StreamFrame]:
         """Compatibility wrapper; prefer iter_streams() + frames_for_stream()."""
         stream = _make_video_stream(camera_id, 1, list(segments))
@@ -318,3 +378,15 @@ def _make_video_stream(camera_id: str, stream_index: int, segments: list[VideoSe
         start_datetime=start,
         end_datetime=end,
     )
+
+
+def _resolve_frame_queue_size(value: int | None = None) -> int:
+    if value is None:
+        raw = os.getenv("CCTV_ROI_FRAME_QUEUE_SIZE")
+        if not raw:
+            return DEFAULT_FRAME_QUEUE_SIZE
+        try:
+            value = int(raw)
+        except ValueError:
+            return DEFAULT_FRAME_QUEUE_SIZE
+    return max(0, int(value))

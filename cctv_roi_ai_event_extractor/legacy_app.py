@@ -749,6 +749,8 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
                 fieldnames=[
                     "run_time",
                     "video_rel_path",
+                    "video_file_name",
+                    "camera_name",
                     "record_type",
                     "event_time_sec",
                     "interval_start_sec",
@@ -997,6 +999,8 @@ class App(TkinterDnD.Tk if TkinterDnD is not None else tk.Tk):
                 csv_rows.append({
                     "run_time": run_time,
                     "video_rel_path": item["video_rel_path"],
+                    "video_file_name": item.get("video_file_name", os.path.basename(item.get("video_rel_path", ""))),
+                    "camera_name": item.get("camera_name", item.get("camera_id", "")),
                     "record_type": item["type"],
                     "event_time_sec": item["event_time_sec"],
                     "interval_start_sec": item["interval_start_sec"],
