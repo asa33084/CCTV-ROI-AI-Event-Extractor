@@ -590,16 +590,30 @@ class PaddleOcrEngine(OcrEngine):
 
         config = load_config()
         kwargs = {
-            "text_detection_model_name": config.lpr_paddle_det_model_name,
-            "text_recognition_model_name": config.lpr_paddle_rec_model_name,
+            "ocr_version": config.lpr_paddle_ocr_version,
+            "lang": config.lpr_paddle_lang,
+            "engine": config.lpr_paddle_engine,
+            "device": config.lpr_paddle_device,
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_textline_orientation": False,
         }
-        if not config.lpr_paddle_det_model_name and not config.lpr_paddle_rec_model_name:
-            kwargs["ocr_version"] = config.lpr_paddle_ocr_version
-        if config.lpr_paddle_device:
-            kwargs["device"] = config.lpr_paddle_device
+        if config.lpr_paddle_det_model_name:
+            kwargs["text_detection_model_name"] = config.lpr_paddle_det_model_name
+        if config.lpr_paddle_rec_model_name:
+            kwargs["text_recognition_model_name"] = config.lpr_paddle_rec_model_name
+        if config.lpr_paddle_det_model_dir:
+            kwargs["text_detection_model_dir"] = os.path.abspath(
+                os.path.expanduser(config.lpr_paddle_det_model_dir)
+            )
+        if config.lpr_paddle_rec_model_dir:
+            kwargs["text_recognition_model_dir"] = os.path.abspath(
+                os.path.expanduser(config.lpr_paddle_rec_model_dir)
+            )
+        if config.lpr_paddle_cls_model_dir:
+            kwargs["textline_orientation_model_dir"] = os.path.abspath(
+                os.path.expanduser(config.lpr_paddle_cls_model_dir)
+            )
 
         self.ocr = PaddleOCR(**kwargs)
 

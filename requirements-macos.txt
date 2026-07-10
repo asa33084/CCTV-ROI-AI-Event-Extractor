@@ -1,0 +1,6 @@
+# macOS default install.
+# Installs PyTorch wheels from PyPI. On Apple Silicon, PyTorch may expose MPS
+# when the host OS, hardware, and installed wheel support it.
+# Do not use requirements-gpu.txt on macOS; CUDA wheels are not supported there.
+-r requirements.txt
+

@@ -69,7 +69,7 @@ from cctv_roi_ai_event_extractor.evidence_report import write_evidence_workbook
 
 
 LPR_OCR_CHOICES = (
-    ("PaddleOCR（PP-OCRv5）", "paddleocr"),
+    ("PaddleOCR ONNX（PP-OCRv6）", "paddleocr"),
     ("SVTR / ONNX", "svtr"),
     ("YOLO26x 車牌號碼", "plate_number_yolo26x"),
     ("Tesseract OCR", "tesseract"),

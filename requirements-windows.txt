@@ -1,0 +1,5 @@
+# Windows default install.
+# Installs portable CPU/default wheels from PyPI.
+# For NVIDIA CUDA acceleration on Windows, install requirements-gpu.txt instead.
+-r requirements.txt
+

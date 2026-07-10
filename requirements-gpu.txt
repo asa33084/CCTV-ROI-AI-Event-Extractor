@@ -1,9 +1,11 @@
--r requirements.txt
+# Windows/Ubuntu NVIDIA CUDA install only.
+# Do not use this file on macOS.
 --index-url https://download.pytorch.org/whl/cu126
 --extra-index-url https://pypi.org/simple
+-r requirements.txt
 torch==2.9.1
 torchvision==0.24.1
 torchaudio==2.9.1
 
-# PaddleOCR is included by requirements.txt.
-# If you intentionally use PaddlePaddle GPU in this same env, install it with --no-deps.
+# PaddleOCR uses the official onnxruntime engine in requirements.txt, so this
+# file only replaces the PyTorch wheels with CUDA builds.

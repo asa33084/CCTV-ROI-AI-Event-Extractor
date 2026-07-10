@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 
 # 所有設定都先從環境變數讀取，讓打包後的 EXE 與開發環境可以共用同一套邏輯。
-APP_VERSION = "4.4.0-roi-yolo26x-dragdrop-paste-paths"
+APP_VERSION = "6.0.0-roi-yolo26x-onnx-ocr"
 
 ENV_APP_DIR = "CCTV_ROI_APP_DIR"
 ENV_MODEL_PATH = "CCTV_ROI_MODEL_PATH"
@@ -23,9 +23,14 @@ ENV_LPR_SVTR_PROVIDERS = "CCTV_ROI_LPR_SVTR_PROVIDERS"
 ENV_LPR_YOLO_OCR_MODEL_PATH = "CCTV_ROI_LPR_YOLO_OCR_MODEL_PATH"
 ENV_LPR_YOLO_OCR_CONFIDENCE = "CCTV_ROI_LPR_YOLO_OCR_CONFIDENCE"
 ENV_LPR_PADDLE_DEVICE = "CCTV_ROI_LPR_PADDLE_DEVICE"
+ENV_LPR_PADDLE_ENGINE = "CCTV_ROI_LPR_PADDLE_ENGINE"
+ENV_LPR_PADDLE_LANG = "CCTV_ROI_LPR_PADDLE_LANG"
 ENV_LPR_PADDLE_OCR_VERSION = "CCTV_ROI_LPR_PADDLE_OCR_VERSION"
 ENV_LPR_PADDLE_DET_MODEL_NAME = "CCTV_ROI_LPR_PADDLE_DET_MODEL_NAME"
 ENV_LPR_PADDLE_REC_MODEL_NAME = "CCTV_ROI_LPR_PADDLE_REC_MODEL_NAME"
+ENV_LPR_PADDLE_DET_MODEL_DIR = "CCTV_ROI_LPR_PADDLE_DET_MODEL_DIR"
+ENV_LPR_PADDLE_REC_MODEL_DIR = "CCTV_ROI_LPR_PADDLE_REC_MODEL_DIR"
+ENV_LPR_PADDLE_CLS_MODEL_DIR = "CCTV_ROI_LPR_PADDLE_CLS_MODEL_DIR"
 ENV_LPR_TESSERACT_CMD = "CCTV_ROI_LPR_TESSERACT_CMD"
 ENV_ULTRALYTICS_CONFIG_DIR = "YOLO_CONFIG_DIR"
 _DOTENV_LOADED = False
@@ -87,6 +92,16 @@ def ensure_runtime_environment(app_dir: str | None = None) -> None:
         runtime_dir = os.path.join(base_dir, ".runtime", "ultralytics")
         os.makedirs(runtime_dir, exist_ok=True)
         os.environ[ENV_ULTRALYTICS_CONFIG_DIR] = runtime_dir
+    cache_envs = {
+        "PADDLE_PDX_CACHE_HOME": os.path.join(base_dir, ".runtime", "paddlex"),
+        "HF_HOME": os.path.join(base_dir, ".runtime", "huggingface"),
+        "MODELSCOPE_CACHE": os.path.join(base_dir, ".runtime", "modelscope"),
+        "MPLCONFIGDIR": os.path.join(base_dir, ".runtime", "matplotlib"),
+    }
+    for env_name, runtime_dir in cache_envs.items():
+        if not os.getenv(env_name):
+            os.makedirs(runtime_dir, exist_ok=True)
+            os.environ[env_name] = runtime_dir
 
 
 def resolve_long_stay_screenshot_interval(default: float = 5.0) -> float:
@@ -148,9 +163,14 @@ class AppConfig:
     lpr_yolo_ocr_model_path: str | None
     lpr_yolo_ocr_confidence: float
     lpr_paddle_device: str
+    lpr_paddle_engine: str
+    lpr_paddle_lang: str
     lpr_paddle_ocr_version: str
     lpr_paddle_det_model_name: str
     lpr_paddle_rec_model_name: str
+    lpr_paddle_det_model_dir: str | None
+    lpr_paddle_rec_model_dir: str | None
+    lpr_paddle_cls_model_dir: str | None
     lpr_tesseract_cmd: str
 
     @classmethod
@@ -173,10 +193,15 @@ class AppConfig:
             lpr_svtr_providers=os.getenv(ENV_LPR_SVTR_PROVIDERS, "auto"),
             lpr_yolo_ocr_model_path=os.getenv(ENV_LPR_YOLO_OCR_MODEL_PATH),
             lpr_yolo_ocr_confidence=resolve_float_env(ENV_LPR_YOLO_OCR_CONFIDENCE, 0.35),
-            lpr_paddle_device=os.getenv(ENV_LPR_PADDLE_DEVICE, ""),
-            lpr_paddle_ocr_version=os.getenv(ENV_LPR_PADDLE_OCR_VERSION, "PP-OCRv5"),
-            lpr_paddle_det_model_name=os.getenv(ENV_LPR_PADDLE_DET_MODEL_NAME, "PP-OCRv5_mobile_det"),
-            lpr_paddle_rec_model_name=os.getenv(ENV_LPR_PADDLE_REC_MODEL_NAME, "PP-OCRv5_mobile_rec"),
+            lpr_paddle_device=os.getenv(ENV_LPR_PADDLE_DEVICE, "cpu"),
+            lpr_paddle_engine=os.getenv(ENV_LPR_PADDLE_ENGINE, "onnxruntime"),
+            lpr_paddle_lang=os.getenv(ENV_LPR_PADDLE_LANG, "en"),
+            lpr_paddle_ocr_version=os.getenv(ENV_LPR_PADDLE_OCR_VERSION, "PP-OCRv6"),
+            lpr_paddle_det_model_name=os.getenv(ENV_LPR_PADDLE_DET_MODEL_NAME, ""),
+            lpr_paddle_rec_model_name=os.getenv(ENV_LPR_PADDLE_REC_MODEL_NAME, ""),
+            lpr_paddle_det_model_dir=os.getenv(ENV_LPR_PADDLE_DET_MODEL_DIR),
+            lpr_paddle_rec_model_dir=os.getenv(ENV_LPR_PADDLE_REC_MODEL_DIR),
+            lpr_paddle_cls_model_dir=os.getenv(ENV_LPR_PADDLE_CLS_MODEL_DIR),
             lpr_tesseract_cmd=os.getenv(ENV_LPR_TESSERACT_CMD, ""),
         )
 

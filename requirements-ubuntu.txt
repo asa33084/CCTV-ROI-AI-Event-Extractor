@@ -1,0 +1,8 @@
+# Ubuntu default install.
+# Installs portable CPU/default wheels from PyPI.
+# For NVIDIA CUDA acceleration on Ubuntu, install requirements-gpu.txt instead.
+#
+# Qt may also need system packages such as libxcb-cursor0, libxkbcommon-x11-0,
+# and libgl1 depending on the desktop/container environment.
+-r requirements.txt
+
