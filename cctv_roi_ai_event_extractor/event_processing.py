@@ -5,6 +5,7 @@ import queue
 import shutil
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from dataclasses import replace
 from datetime import datetime
 
 import cv2
@@ -54,7 +55,7 @@ STREAM_TRACK_MIN_DURATION_SEC = 0.5
 
 
 def resolve_stream_worker_count(default: int = 1) -> int:
-    """Resolve optional process-level parallelism for independent camera streams."""
+    """Resolve optional process-level parallelism for independent streams."""
     value = os.getenv("CCTV_ROI_STREAM_WORKERS")
     if not value:
         return default
@@ -781,20 +782,22 @@ def _stream_worker_emit(message_queue, kind: str, payload):
         pass
 
 
-def _process_camera_stream_worker(payload):
+def _process_stream_worker(payload):
     detector_config = payload["detector_config"]
     lpr_config = payload.get("lpr_config")
     message_queue = payload.get("message_queue")
     stop_event = payload.get("stop_event")
     camera_id = payload.get("camera_id", "")
+    stream_id = payload.get("stream_id", "")
+    worker_label = stream_id or camera_id
 
     def status_cb(message):
-        prefix = f"[{camera_id}] " if camera_id else ""
+        prefix = f"[{worker_label}] " if worker_label else ""
         _stream_worker_emit(message_queue, "status", prefix + message)
 
     def progress_cb(frame_idx, total_frames):
         _stream_worker_emit(message_queue, "progress", {
-            "camera_id": camera_id,
+            "stream_key": payload.get("stream_key", stream_id),
             "current": int(frame_idx),
             "total": int(total_frames),
         })
@@ -850,6 +853,7 @@ def _process_camera_stream_worker(payload):
         progress_cb=progress_cb,
         status_cb=status_cb,
         stop_checker=stop_checker,
+        stream_id_override=stream_id or None,
     )
 
 
@@ -857,7 +861,7 @@ def _drain_stream_worker_messages(
     message_queue,
     status_cb=None,
     progress_cb=None,
-    camera_progress=None,
+    stream_progress=None,
     debug_frame_cb=None,
 ):
     if message_queue is None:
@@ -875,14 +879,14 @@ def _drain_stream_worker_messages(
         elif kind == "debug" and debug_frame_cb:
             debug_frame_cb(payload)
         elif kind == "progress" and progress_cb:
-            camera_id = payload.get("camera_id", "")
+            stream_key = payload.get("stream_key", "")
             current = int(payload.get("current", 0) or 0)
             total = int(payload.get("total", 0) or 0)
-            if camera_progress is not None and camera_id:
-                camera_progress[camera_id] = (current, total)
+            if stream_progress is not None and stream_key:
+                stream_progress[stream_key] = (current, total)
                 progress_cb(
-                    sum(item[0] for item in camera_progress.values()),
-                    sum(item[1] for item in camera_progress.values()),
+                    sum(item[0] for item in stream_progress.values()),
+                    sum(item[1] for item in stream_progress.values()),
                 )
             else:
                 progress_cb(current, total)
@@ -913,15 +917,15 @@ def process_video_stream_parallel(
     status_cb=None,
     stop_checker=None,
 ):
-    """Process independent cameras in separate processes and aggregate their stream logs."""
+    """Process every independent stream as its own worker task and aggregate logs."""
     worker_count = resolve_stream_worker_count() if worker_count is None else max(1, int(worker_count))
     stream = VideoStreamServer.from_paths(video_paths, input_dir=input_dir, load_metadata=True)
-    camera_paths = [
-        (camera_id, [segment.path for segment in segments])
-        for camera_id, segments in stream.iter_camera_segments()
+    stream_tasks = [
+        (video_stream, [segment.path for segment in video_stream.segments])
+        for video_stream in stream.iter_streams()
     ]
 
-    if worker_count <= 1 or len(camera_paths) <= 1:
+    if worker_count <= 1 or len(stream_tasks) <= 1:
         detector = ObjectDetector(
             detector_config["model_path"],
             conf=detector_config["conf"],
@@ -964,11 +968,11 @@ def process_video_stream_parallel(
             stop_checker=stop_checker,
         )
 
-    worker_count = min(worker_count, len(camera_paths))
+    worker_count = min(worker_count, len(stream_tasks))
     total_frames = stream.total_frames
     if status_cb:
         status_cb(
-            f"[STREAM-PARALLEL] camera workers={worker_count} | cameras={len(camera_paths)} "
+            f"[STREAM-PARALLEL] workers={worker_count} | streams={len(stream_tasks)} "
             f"| videos={len(stream.segments)} | frames={total_frames}"
         )
         if debug_stream_preview:
@@ -997,9 +1001,12 @@ def process_video_stream_parallel(
     success_count = 0
     skipped_count = 0
     stopped_count = 0
-    camera_progress = {
-        camera_id: (0, sum(max(0, int(segment.frame_count or 0)) for segment in segments))
-        for camera_id, segments in stream.iter_camera_segments()
+    stream_progress = {
+        f"{video_stream.camera_id}:{video_stream.stream_id}": (
+            0,
+            sum(max(0, int(segment.frame_count or 0)) for segment in video_stream.segments),
+        )
+        for video_stream, _paths in stream_tasks
     }
 
     mp_context = mp.get_context("spawn")
@@ -1031,26 +1038,29 @@ def process_video_stream_parallel(
 
     futures = {}
     with ProcessPoolExecutor(max_workers=worker_count, mp_context=mp_context) as executor:
-        for camera_id, paths in camera_paths:
+        for video_stream, paths in stream_tasks:
             payload = dict(base_payload)
-            payload["camera_id"] = camera_id
+            stream_key = f"{video_stream.camera_id}:{video_stream.stream_id}"
+            payload["camera_id"] = video_stream.camera_id
+            payload["stream_id"] = video_stream.stream_id
+            payload["stream_key"] = stream_key
             payload["video_paths"] = paths
-            futures[executor.submit(_process_camera_stream_worker, payload)] = camera_id
+            futures[executor.submit(_process_stream_worker, payload)] = stream_key
 
         pending = set(futures)
         while pending:
             if stop_checker and stop_checker():
                 stop_event.set()
             done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
-            _drain_stream_worker_messages(message_queue, status_cb, progress_cb, camera_progress, debug_frame_cb)
+            _drain_stream_worker_messages(message_queue, status_cb, progress_cb, stream_progress, debug_frame_cb)
             for future in done:
-                camera_id = futures[future]
+                stream_key = futures[future]
                 try:
                     result = future.result()
                 except Exception as exc:
                     stopped_count += 1
                     if status_cb:
-                        status_cb(f"[STREAM-PARALLEL-ERROR] camera={camera_id} | {exc}")
+                        status_cb(f"[STREAM-PARALLEL-ERROR] stream={stream_key} | {exc}")
                     continue
                 logs.extend(result.get("logs", []))
                 grabbed_count += int(result.get("grabbed_count", 0) or 0)
@@ -1059,7 +1069,7 @@ def process_video_stream_parallel(
                 skipped_count += int(result.get("skipped_count", 0) or 0)
                 stopped_count += int(result.get("stopped_count", 0) or 0)
 
-    _drain_stream_worker_messages(message_queue, status_cb, progress_cb, camera_progress, debug_frame_cb)
+    _drain_stream_worker_messages(message_queue, status_cb, progress_cb, stream_progress, debug_frame_cb)
     manager.shutdown()
     logs.sort(key=lambda item: (
         item.get("camera_id", ""),
@@ -1116,6 +1126,7 @@ def process_video_stream(
     progress_cb=None,
     status_cb=None,
     stop_checker=None,
+    stream_id_override: str | None = None,
 ):
     """Process multiple video files as per-camera streams and summarize each tracked vehicle."""
     del start_trigger_frames, end_hold_sec
@@ -1130,6 +1141,9 @@ def process_video_stream(
     detection_mask = None
 
     stream = VideoStreamServer.from_paths(video_paths, input_dir=input_dir, load_metadata=True)
+    video_streams = list(stream.iter_streams())
+    if stream_id_override and len(video_streams) == 1:
+        video_streams[0] = replace(video_streams[0], stream_id=stream_id_override)
     total_frames = stream.total_frames
     segments_by_rel_path = {segment.rel_path: segment for segment in stream.segments}
     debug_preview_closed = False
@@ -1160,7 +1174,7 @@ def process_video_stream(
                     "stream_id": video_stream.stream_id,
                     "segments": [segment.rel_path for segment in video_stream.segments],
                 }
-                for video_stream in stream.iter_streams()
+                for video_stream in video_streams
             ],
         })
 
@@ -1186,7 +1200,7 @@ def process_video_stream(
             "stopped_count": 1,
         }
 
-    for video_stream in stream.iter_streams():
+    for video_stream in video_streams:
         camera_id = video_stream.camera_id
         stream_id = video_stream.stream_id
         segments = list(video_stream.segments)
